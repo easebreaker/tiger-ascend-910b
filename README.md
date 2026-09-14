@@ -1,3 +1,10 @@
+# Ascend 910B 生成式推荐部署笔记
+
+- **HSTU / Meta GR**：本文下方 checklist（有昇腾官方样例）
+- **TIGER（语义 ID + T5）**：[docs/TIGER_910B_DEPLOY.md](docs/TIGER_910B_DEPLOY.md)（无官方一键样例，需自行迁 NPU）
+
+---
+
 # Ascend 910B 上部署 HSTU（生成式推荐）Checklist
 
 基于 [cann-recipes-infer/models/hstu](https://github.com/hicann/cann-recipes-infer/tree/master/models/hstu) 官方样例整理。  
