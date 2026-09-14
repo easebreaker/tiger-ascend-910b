@@ -1,0 +1,3 @@
+# Optional Ascend extras (install on 910B hosts only; versions must match CANN)
+# torch-npu==<same as torch>
+# apex / apex-npu if your stack requires it for AMP
