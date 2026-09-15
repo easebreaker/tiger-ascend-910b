@@ -72,13 +72,36 @@ def build_model(train_ds: TigerSeqDataset, args):
     return tok, model
 
 
+def _validate_json_alignment(inters, indices):
+    missing = sorted(
+        {
+            str(item)
+            for seq in inters.values()
+            for item in seq
+            if str(item) not in indices
+        }
+    )
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise ValueError(
+            f"semantic_ids.json missing {len(missing)} item ids referenced by inter.json "
+            f"(e.g. {preview}). Keys must match."
+        )
+
+
 def train_loop(args):
     info = resolve_device(args.device)
     print(f"[device] kind={info.kind} device={info.device} count={info.device_count}")
     inters = load_json(inter_path(args.data_dir))
     indices = load_json(indice_path(args.data_dir))
+    _validate_json_alignment(inters, indices)
     train_ds = TigerSeqDataset(inters, indices, args.max_his_len, mode="train")
     valid_ds = TigerSeqDataset(inters, indices, args.max_his_len, mode="valid")
+    if len(train_ds) == 0:
+        raise RuntimeError(
+            "train dataset is empty. Each user needs >=4 interactions "
+            "(leave-one-out needs history for train/valid/test)."
+        )
     tok, model = build_model(train_ds, args)
     model.to(info.device)
 

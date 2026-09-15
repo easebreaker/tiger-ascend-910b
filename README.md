@@ -28,16 +28,19 @@ python -m tiger_ascend.ops.probe --device cpu
 
 ## 910B 上跑
 
+逐步部署请看：**[docs/DEPLOY_STEP_BY_STEP_910B.md](docs/DEPLOY_STEP_BY_STEP_910B.md)**  
+环境与算子清单：**[docs/ASCEND_910B_ENV_AND_OPS.md](docs/ASCEND_910B_ENV_AND_OPS.md)**
+
 ```bash
-# 1) 配好 CANN + torch / torch_npu（见 docs/ASCEND_910B_ENV_AND_OPS.md）
+# 1) 配好 CANN + torch / torch_npu
 source /usr/local/Ascend/ascend-toolkit/set_env.sh   # 路径按本机安装调整
 
 # 2) 算子探测
-python -m tiger_ascend.ops.probe --device npu --out artifacts/op_probe.json
+python3 -m tiger_ascend.ops.probe --device npu --out artifacts/op_probe.json
 
 # 3) toy 训练
 ASCEND_RT_VISIBLE_DEVICES=0 \
-python scripts/train_tiger.py --mode all --device npu --epochs 2 --batch_size 8
+python3 scripts/train_tiger.py --mode all --device npu --epochs 2 --batch_size 8
 ```
 
 ## 与 HSTU / RecSDK 的关系
