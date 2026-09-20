@@ -8,14 +8,31 @@
 ## 仓库结构
 
 ```text
-tiger_ascend/
-  model/tiger.py          # 自 torch-rechub 改编的 TIGERModel（去硬编码 CUDA）
-  data/dataset.py         # TigerSeqDataset + Trie 受限解码
-  data/tokenizer.py       # 离线 Semantic-ID tokenizer（无需下载 T5 词表）
-  utils/device.py         # auto/npu/cuda/cpu 设备选择
-  ops/probe.py            # 910B 必要算子探测
-scripts/train_tiger.py    # toy → train → eval 入口
+tiger_ascend/                 # 模型 / 数据 / NPU 工具
+data/amazon_beauty/           # Amazon Beauty 预处理数据（论文同款）
+scripts/train_tiger.py        # toy / train / eval 入口
+scripts/convert_tiger_amazon_index.py
 docs/ASCEND_910B_ENV_AND_OPS.md
+docs/DEPLOY_STEP_BY_STEP_910B.md
+```
+
+## 真实数据（Amazon Beauty）
+
+已内置论文常用的 **Amazon Beauty** 预处理数据（交互 + RQ-VAE 语义 ID）：
+
+- 说明：[`data/amazon_beauty/README.md`](data/amazon_beauty/README.md)
+- 全量：`data/amazon_beauty/`（约 2.2 万用户 / 1.2 万 item）
+- 快速试跑：`data/amazon_beauty/subset_512u/`
+
+```bash
+# 子集上 NPU 训练（不要用 --mode all，以免覆盖真实数据）
+python scripts/train_tiger.py --mode train --device npu \
+  --data_dir data/amazon_beauty/subset_512u \
+  --output_dir artifacts/ckpt_beauty_subset --epochs 3 --batch_size 16
+
+python scripts/train_tiger.py --mode eval --device npu \
+  --data_dir data/amazon_beauty/subset_512u \
+  --output_dir artifacts/ckpt_beauty_subset
 ```
 
 ## 快速开始（CPU 冒烟）

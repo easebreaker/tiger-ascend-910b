@@ -1,0 +1,21 @@
+{
+  "dataset": "Amazon Beauty (5-core style processed)",
+  "source_repo": "https://github.com/NonameUntitled/tiger",
+  "paper": "Rajput et al., Recommender Systems with Generative Retrieval (NeurIPS 2023), arXiv:2305.05065",
+  "raw_amazon": "https://jmcauley.ucsd.edu/data/amazon/",
+  "n_users": 22363,
+  "n_items": 12101,
+  "semantic_levels": [
+    "a",
+    "b",
+    "c",
+    "d"
+  ],
+  "codebook_size_per_level": 256,
+  "sid_method": "RQ-VAE index from NonameUntitled/tiger (index_rqvae.json)",
+  "notes": [
+    "Item ids are 0-based as in the source processed files.",
+    "semantic_ids tokens use <a_*> <b_*> <c_*> <d_*> for 4 residual levels.",
+    "subset_512u/ is a small slice for quick NPU smoke training."
+  ]
+}

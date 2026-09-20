@@ -15,5 +15,11 @@ This repository adapts code and ideas from:
    https://github.com/huggingface/transformers
    License: Apache License 2.0
 
+3) Amazon Beauty processed interactions + RQ-VAE semantic index
+   Source packaging: https://github.com/NonameUntitled/tiger
+   (see data/amazon_beauty/SOURCE_LICENCE)
+   Original reviews: https://jmcauley.ucsd.edu/data/amazon/
+   Paper: Rajput et al., Recommender Systems with Generative Retrieval (NeurIPS 2023)
+
 Paper reference:
   Rajput et al., Recommender Systems with Generative Retrieval (TIGER).
