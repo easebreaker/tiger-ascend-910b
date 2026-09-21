@@ -38,6 +38,8 @@ def parse_args():
     p.add_argument("--max_his_len", type=int, default=20)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--num_beams", type=int, default=4)
+    p.add_argument("--eval_ks", type=str, default="1,5,10", help="Hit@K list, e.g. 1,5,10")
+    p.add_argument("--print_samples", type=int, default=5, help="print N pred/gold pairs during eval")
     p.add_argument("--toy_users", type=int, default=32)
     p.add_argument("--toy_items", type=int, default=64)
     p.add_argument("--d_model", type=int, default=128)
@@ -163,33 +165,55 @@ def eval_loop(args):
     candidate_ids = [tok.encode(sid, add_eos=True) for sid in test_ds.get_all_items(as_list=True)]
     prefix_fn = Trie(candidate_ids).prefix_allowed_tokens_fn(bos_token_id=tok.pad_token_id)
 
+    ks = sorted({int(x) for x in args.eval_ks.split(",") if x.strip()})
+    topk = max(ks) if ks else 1
+    num_return = max(topk, args.num_beams)
+    num_beams = max(args.num_beams, num_return)
+
     loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=test_ds.get_collate_fn(tok),
     )
-    hit = total = 0
+    hits = {k: 0 for k in ks}
+    total = 0
+    printed = 0
     for batch in loader:
         labels = batch.pop("labels")
+        bsz = labels.size(0)
         batch = {k: v.to(info.device) for k, v in batch.items()}
         gen = model.generate(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             max_new_tokens=8,
-            num_beams=args.num_beams,
-            num_return_sequences=1,
+            num_beams=num_beams,
+            num_return_sequences=num_return,
             prefix_allowed_tokens_fn=prefix_fn,
             eos_token_id=tok.eos_token_id,
             pad_token_id=tok.pad_token_id,
         )
-        for i in range(gen.size(0)):
-            pred = tok.decode(gen[i].tolist())
+        # generate returns [bsz * num_return, seq]
+        gen = gen.view(bsz, num_return, -1)
+        for i in range(bsz):
             gold_ids = [x for x in labels[i].tolist() if x != -100]
             gold = tok.decode(gold_ids)
-            hit += int(pred == gold)
+            preds = [tok.decode(gen[i, j].tolist()) for j in range(num_return)]
+            for k in ks:
+                hits[k] += int(gold in preds[:k])
+            if printed < args.print_samples:
+                print(f"[sample {printed}] gold={gold}")
+                print(f"             pred@1={preds[0]}")
+                if num_return > 1:
+                    print(f"             pred@beam={preds[: min(3, num_return)]}")
+                printed += 1
             total += 1
-    print(f"exact_match={hit}/{total} = {hit / max(1, total):.4f}")
+
+    for k in ks:
+        print(f"hit@{k}={hits[k]}/{total} = {hits[k] / max(1, total):.4f}")
+    # keep old name for top-1 exact match
+    if 1 in hits:
+        print(f"exact_match(hit@1)={hits[1]}/{total} = {hits[1] / max(1, total):.4f}")
 
 
 def main():
