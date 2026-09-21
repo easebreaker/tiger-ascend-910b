@@ -40,6 +40,12 @@ def parse_args():
     p.add_argument("--num_beams", type=int, default=4)
     p.add_argument("--eval_ks", type=str, default="1,5,10", help="Hit@K list, e.g. 1,5,10")
     p.add_argument("--print_samples", type=int, default=5, help="print N pred/gold pairs during eval")
+    p.add_argument(
+        "--diag_batches",
+        type=int,
+        default=50,
+        help="max batches for train/test teacher-forcing diagnostics",
+    )
     p.add_argument("--toy_users", type=int, default=32)
     p.add_argument("--toy_items", type=int, default=64)
     p.add_argument("--d_model", type=int, default=128)
@@ -148,38 +154,90 @@ def train_loop(args):
     print(f"saved checkpoint -> {args.output_dir}")
 
 
+def _ce_acc_lower_bound(token_acc: float) -> float:
+    """Min possible mean CE if wrong tokens have p_gold < 0.5 (argmax wrong)."""
+    import math
+
+    return max(0.0, (1.0 - token_acc) * math.log(2.0))
+
+
 @torch.no_grad()
-def _teacher_forcing_stats(model, loader, device, tok, max_batches: int = 20):
-    """Compare train-style teacher forcing vs labels (exposes train/gen gap)."""
+def _teacher_forcing_stats(
+    model,
+    loader,
+    device,
+    tok,
+    split_name: str,
+    max_batches: int = 50,
+    print_ok: int = 2,
+):
+    """Teacher-forcing CE / token-acc / per-position acc on one split.
+
+    Low train CE with low test TF acc ⇒ overfitting / LOO hardness, not a CE bug.
+    CE below ``_ce_acc_lower_bound(token_acc)`` on the *same* split ⇒ metric bug.
+    """
     token_correct = token_total = 0
     seq_correct = seq_total = 0
+    loss_sum = 0.0
+    steps = 0
+    pos_correct: list[int] = []
+    pos_total: list[int] = []
+    shown = 0
     for bi, batch in enumerate(loader):
         if bi >= max_batches:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["labels"]
         out = model(**batch)
+        loss_sum += float(out.loss.detach().cpu())
+        steps += 1
         pred = out.logits.argmax(dim=-1)
         mask = labels != -100
         token_correct += int((pred[mask] == labels[mask]).sum().item())
         token_total += int(mask.sum().item())
         for i in range(labels.size(0)):
-            m = mask[i]
-            if not bool(m.any()):
+            positions = mask[i].nonzero(as_tuple=True)[0]
+            if positions.numel() == 0:
                 continue
             seq_total += 1
-            if bool(torch.equal(pred[i][m], labels[i][m])):
+            gold_toks = labels[i][positions]
+            pred_toks = pred[i][positions]
+            if bool(torch.equal(pred_toks, gold_toks)):
                 seq_correct += 1
-                if seq_correct <= 2:
-                    gold = tok.decode([x for x in labels[i].tolist() if x != -100])
-                    hyp = tok.decode(pred[i][m].tolist())
-                    print(f"[tf-ok] gold={gold} tf_pred={hyp}")
+                if shown < print_ok:
+                    gold = tok.decode(gold_toks.tolist())
+                    hyp = tok.decode(pred_toks.tolist())
+                    print(f"[tf-ok/{split_name}] gold={gold} tf_pred={hyp}")
+                    shown += 1
+            for pi, pos in enumerate(positions.tolist()):
+                while pi >= len(pos_correct):
+                    pos_correct.append(0)
+                    pos_total.append(0)
+                pos_total[pi] += 1
+                pos_correct[pi] += int(pred[i, pos].item() == labels[i, pos].item())
+
+    token_acc = token_correct / max(1, token_total)
+    ce = loss_sum / max(1, steps)
+    lb = _ce_acc_lower_bound(token_acc)
     print(
-        f"[diag] teacher_forcing token_acc="
-        f"{token_correct / max(1, token_total):.4f} "
+        f"[diag/{split_name}] teacher_forcing "
+        f"ce={ce:.4f} token_acc={token_acc:.4f} "
         f"seq_exact={seq_correct}/{seq_total}="
-        f"{seq_correct / max(1, seq_total):.4f}"
+        f"{seq_correct / max(1, seq_total):.4f} "
+        f"ce_lb(acc)≈{lb:.4f}"
     )
+    if steps and ce + 1e-4 < lb:
+        print(
+            f"[diag/{split_name}] WARNING: ce < lower-bound from token_acc "
+            f"on the SAME split — check loss/acc alignment."
+        )
+    pos_parts = []
+    for i, (c, t) in enumerate(zip(pos_correct, pos_total)):
+        if t:
+            pos_parts.append(f"p{i}={c / t:.3f}")
+    if pos_parts:
+        print(f"[diag/{split_name}] per_pos_acc " + " ".join(pos_parts))
+    return {"ce": ce, "token_acc": token_acc, "seq_exact": seq_correct / max(1, seq_total)}
 
 
 @torch.no_grad()
@@ -187,6 +245,7 @@ def eval_loop(args):
     info = resolve_device(args.device)
     inters = load_json(inter_path(args.data_dir))
     indices = load_json(indice_path(args.data_dir))
+    train_ds = TigerSeqDataset(inters, indices, args.max_his_len, mode="train")
     test_ds = TigerSeqDataset(inters, indices, args.max_his_len, mode="test")
     tok = SemanticIdTokenizer.from_pretrained(args.output_dir)
     cfg = T5Config.from_pretrained(args.output_dir)
@@ -199,28 +258,54 @@ def eval_loop(args):
     candidate_ids = [tok.encode(sid, add_eos=True) for sid in test_ds.get_all_items(as_list=True)]
     prefix_fn = Trie(candidate_ids).prefix_allowed_tokens_fn(bos_token_id=tok.pad_token_id)
     n_items = len(candidate_ids)
-    print(f"[diag] n_test={len(test_ds)} n_items_in_trie={n_items} "
-          f"random_hit@10≈{10 / max(1, n_items):.4f}")
+    print(
+        f"[diag] n_train={len(train_ds)} n_test={len(test_ds)} "
+        f"n_items_in_trie={n_items} random_hit@10≈{10 / max(1, n_items):.4f}"
+    )
+    print(
+        "[diag] leave-one-out: train predicts items[:-2] windows; "
+        "test target is items[-1] (never a train target for that user)."
+    )
 
     ks = sorted({int(x) for x in args.eval_ks.split(",") if x.strip()})
     topk = max(ks) if ks else 1
     num_return = max(topk, args.num_beams)
     num_beams = max(args.num_beams, num_return)
 
-    loader = DataLoader(
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=train_ds.get_collate_fn(tok),
+    )
+    test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=test_ds.get_collate_fn(tok),
     )
-    # Teacher-forcing diagnostic: if this is high but hit@k is low, code path is OK
-    # and the gap is autoregressive generation difficulty.
-    _teacher_forcing_stats(model, loader, info.device, tok)
+    # Compare splits: train loss≈train TF ce; test TF acc<<train ⇒ overfit / LOO, not CE bug.
+    train_stats = _teacher_forcing_stats(
+        model, train_loader, info.device, tok, "train", max_batches=args.diag_batches
+    )
+    test_stats = _teacher_forcing_stats(
+        model, test_loader, info.device, tok, "test", max_batches=args.diag_batches
+    )
+    if train_stats["token_acc"] - test_stats["token_acc"] > 0.25:
+        print(
+            "[diag] large train/test TF gap → model memorizes train next-SID; "
+            "Hit@K on held-out last item can stay near random. Code path OK."
+        )
+    if test_stats["token_acc"] < 0.55:
+        print(
+            "[diag] test TF token_acc is modest; autoregressive Hit@K will be much "
+            "lower (errors compound over a/b/c/d)."
+        )
 
     hits = {k: 0 for k in ks}
     total = 0
     printed = 0
-    for batch in loader:
+    for batch in test_loader:
         labels = batch.pop("labels")
         bsz = labels.size(0)
         batch = {k: v.to(info.device) for k, v in batch.items()}
@@ -234,7 +319,7 @@ def eval_loop(args):
             eos_token_id=tok.eos_token_id,
             pad_token_id=tok.pad_token_id,
         )
-        # generate returns [bsz * num_return, seq]
+        # generate returns [bsz * num_return, seq]; usually starts with decoder_start (pad)
         gen = gen.view(bsz, num_return, -1)
         for i in range(bsz):
             gold_ids = [x for x in labels[i].tolist() if x != -100]

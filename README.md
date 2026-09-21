@@ -35,6 +35,18 @@ python scripts/train_tiger.py --mode eval --device npu \
   --output_dir artifacts/ckpt_beauty_subset
 ```
 
+## 指标怎么读（loss ↓ 但 Hit@K≈0）
+
+Leave-one-out 下 **train loss 和 test Hit@K 不是同一任务**：
+
+- 训练：对每个用户 `items[:-2]` 做滑窗 next-SID（teacher forcing）
+- 测试：用 `items[:-1]` 预测从未当过该用户训练目标的 `items[-1]`，再 **自回归 + Trie beam** 生成整条 SID
+
+因此常见现象：`train_loss≈0.2` 但 `token_acc(test TF)≈0.35`、`Hit@10≈0`。  
+**同一次 eval 会打印 `[diag/train]` 与 `[diag/test]`**：若 train TF 很高、test TF 低 → 过拟合/LOO 难度，不是 CE 对齐写错；若同一 split 上 `ce < ce_lb(acc)` 才会报 WARNING。
+
+随机基线（Beauty subset ≈3175 items）：`Hit@10 ≈ 10/3175 ≈ 0.003`。
+
 ## 快速开始（CPU 冒烟）
 
 ```bash
