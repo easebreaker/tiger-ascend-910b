@@ -149,6 +149,40 @@ def train_loop(args):
 
 
 @torch.no_grad()
+def _teacher_forcing_stats(model, loader, device, tok, max_batches: int = 20):
+    """Compare train-style teacher forcing vs labels (exposes train/gen gap)."""
+    token_correct = token_total = 0
+    seq_correct = seq_total = 0
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch["labels"]
+        out = model(**batch)
+        pred = out.logits.argmax(dim=-1)
+        mask = labels != -100
+        token_correct += int((pred[mask] == labels[mask]).sum().item())
+        token_total += int(mask.sum().item())
+        for i in range(labels.size(0)):
+            m = mask[i]
+            if not bool(m.any()):
+                continue
+            seq_total += 1
+            if bool(torch.equal(pred[i][m], labels[i][m])):
+                seq_correct += 1
+                if seq_correct <= 2:
+                    gold = tok.decode([x for x in labels[i].tolist() if x != -100])
+                    hyp = tok.decode(pred[i][m].tolist())
+                    print(f"[tf-ok] gold={gold} tf_pred={hyp}")
+    print(
+        f"[diag] teacher_forcing token_acc="
+        f"{token_correct / max(1, token_total):.4f} "
+        f"seq_exact={seq_correct}/{seq_total}="
+        f"{seq_correct / max(1, seq_total):.4f}"
+    )
+
+
+@torch.no_grad()
 def eval_loop(args):
     info = resolve_device(args.device)
     inters = load_json(inter_path(args.data_dir))
@@ -164,6 +198,9 @@ def eval_loop(args):
 
     candidate_ids = [tok.encode(sid, add_eos=True) for sid in test_ds.get_all_items(as_list=True)]
     prefix_fn = Trie(candidate_ids).prefix_allowed_tokens_fn(bos_token_id=tok.pad_token_id)
+    n_items = len(candidate_ids)
+    print(f"[diag] n_test={len(test_ds)} n_items_in_trie={n_items} "
+          f"random_hit@10≈{10 / max(1, n_items):.4f}")
 
     ks = sorted({int(x) for x in args.eval_ks.split(",") if x.strip()})
     topk = max(ks) if ks else 1
@@ -176,6 +213,10 @@ def eval_loop(args):
         shuffle=False,
         collate_fn=test_ds.get_collate_fn(tok),
     )
+    # Teacher-forcing diagnostic: if this is high but hit@k is low, code path is OK
+    # and the gap is autoregressive generation difficulty.
+    _teacher_forcing_stats(model, loader, info.device, tok)
+
     hits = {k: 0 for k in ks}
     total = 0
     printed = 0
