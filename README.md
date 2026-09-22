@@ -15,6 +15,7 @@ scripts/convert_tiger_amazon_index.py
 docs/ASCEND_910B_ENV_AND_OPS.md
 docs/DEPLOY_STEP_BY_STEP_910B.md
 docs/PAPER_BEAUTY_910B.md
+docs/FIDELITY_AND_910B_CLAIMS.md
 ```
 
 ## 真实数据（Amazon Beauty）
