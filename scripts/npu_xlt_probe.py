@@ -52,9 +52,11 @@ def main() -> None:
     n = sum(p.numel() for p in model.parameters()) / 1e6
     log(f"[probe 4] params={n:.2f}M d_model={cfg.d_model} heads={cfg.num_heads} d_kv={cfg.d_kv}")
 
-    log("[probe 5] model.to(npu)")
-    model.to("npu:0")
-    torch.npu.synchronize()
+    log("[probe 5] safe param-wise move to npu (not bulk model.to)")
+    from tiger_ascend.utils.device import move_module_to_device_safe, prepare_npu_runtime
+
+    prepare_npu_runtime(0)
+    move_module_to_device_safe(model, "npu:0", log=True, sync_each=True)
     log("[probe 5] ok")
 
     log("[probe 6] forward+backward batch=2 seq=80")

@@ -3,6 +3,8 @@ from .device import (
     amp_device_type,
     dataloader_kwargs,
     move_batch_to_device,
+    move_module_to_device_safe,
+    prepare_npu_runtime,
     resolve_device,
     synchronize,
 )
@@ -15,7 +17,9 @@ __all__ = [
     "dataloader_kwargs",
     "format_vs_paper",
     "move_batch_to_device",
+    "move_module_to_device_safe",
     "ndcg_at_k",
+    "prepare_npu_runtime",
     "resolve_device",
     "summarize_ranking",
     "synchronize",

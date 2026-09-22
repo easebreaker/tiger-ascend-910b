@@ -194,3 +194,23 @@ def test_xlt_config_size():
     assert cfg2.d_model == 128 and cfg2.num_heads * cfg2.d_kv == cfg2.d_model
     cfg3 = build_xlt_t5_config(1025, layout="npu_large")
     assert cfg3.d_model == 384 and cfg3.num_heads * cfg3.d_kv == cfg3.d_model
+
+
+def test_move_module_to_device_safe_cpu_and_shared():
+    """T5 reuses shared Embedding; safe move must keep tying and land on device."""
+    from transformers import T5ForConditionalGeneration
+
+    from tiger_ascend.model.tiger import build_xlt_t5_config
+    from tiger_ascend.utils.device import move_module_to_device_safe
+
+    cfg = build_xlt_t5_config(128, layout="npu_safe", use_cache=False)
+    model = T5ForConditionalGeneration(cfg)
+    assert model.shared is model.encoder.embed_tokens
+    assert model.shared is model.decoder.embed_tokens
+    move_module_to_device_safe(model, "cpu", log=False, sync_each=False)
+    assert model.shared is model.encoder.embed_tokens
+    assert next(model.parameters()).device.type == "cpu"
+    # unique Parameter object count < naive named_parameters(False) count
+    all_p = list(model.named_parameters(remove_duplicate=False))
+    uniq_p = list(model.named_parameters(remove_duplicate=True))
+    assert len(all_p) > len(uniq_p)

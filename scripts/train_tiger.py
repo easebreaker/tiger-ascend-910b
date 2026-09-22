@@ -34,6 +34,7 @@ from tiger_ascend.utils.device import (  # noqa: E402
     amp_device_type,
     dataloader_kwargs,
     move_batch_to_device,
+    move_module_to_device_safe,
     resolve_device,
     synchronize,
 )
@@ -312,7 +313,10 @@ def train_loop(args):
             "(leave-one-out needs history for train/valid/test)."
         )
     tok, model = build_model(train_ds, args)
-    model.to(info.device)
+    if info.kind == "npu":
+        model = move_module_to_device_safe(model, info.device, log=True, sync_each=True)
+    else:
+        model.to(info.device)
 
     use_amp = bool(args.amp and info.kind in {"cuda", "npu"})
     scaler = _make_grad_scaler(info, use_amp)
@@ -483,7 +487,10 @@ def eval_loop(args):
     model = TIGERModel(cfg)
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
-    model.to(info.device)
+    if info.kind == "npu":
+        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
+    else:
+        model.to(info.device)
     model.eval()
 
     candidate_ids = [tok.encode(sid, add_eos=True) for sid in test_ds.get_all_items(as_list=True)]

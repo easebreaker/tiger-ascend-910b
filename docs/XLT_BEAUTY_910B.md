@@ -41,8 +41,10 @@ export ASCEND_LAUNCH_BLOCKING=1
 python -u scripts/npu_basic_probe.py
 
 # 1c) basic 通过但 smoke 死在 model.to(npu)：
+#     原因常是 T5 shared Embedding 被 encoder/decoder 各 .to() 一次 → Ascend Abort
+#     训练脚本已改为 param-wise 去重搬运；探针顺序：m3=safe → m4=bulk
 python -u scripts/npu_model_to_probe.py
-# 看最后停在 m1 / m2 / m3
+# 期望：[m3] safe move ok；若 [m4] Abort 可忽略（smoke 已不走 bulk .to）
 
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke

@@ -36,6 +36,8 @@ from tiger_ascend.utils.device import (  # noqa: E402
     amp_device_type,
     dataloader_kwargs,
     move_batch_to_device,
+    move_module_to_device_safe,
+    prepare_npu_runtime,
     resolve_device,
     synchronize,
 )
@@ -289,20 +291,14 @@ def train_loop(args):
 
     print("[step] build model", flush=True)
     model = build_model(args, info.kind)
-    print(f"[step] set_device + model.to({info.device})", flush=True)
+    print(f"[step] move model -> {info.device} (safe/dedup for NPU)", flush=True)
     if info.kind == "npu":
-        import torch
-
-        torch.npu.set_device(0)
-        torch.npu.synchronize()
-        print("[step] empty sync before to() ok", flush=True)
-        # Prefer .npu() then fall back to .to(); some torch_npu builds differ.
-        try:
-            model = model.npu()
-        except Exception as e:
-            print(f"[step] model.npu() failed ({e!r}), trying .to(npu:0)", flush=True)
-            model = model.to(info.device)
-        torch.npu.synchronize()
+        prepare_npu_runtime(0)
+        print("[step] prepare_npu_runtime ok", flush=True)
+        # Do NOT use model.to(npu) / model.npu(): T5 shares `shared` under
+        # encoder/decoder embed_tokens; recursive .to() double-applies H2D and
+        # Aborts on some torch_npu builds even after basic probes pass.
+        model = move_module_to_device_safe(model, info.device, log=True, sync_each=True)
     else:
         model.to(info.device)
     print("[step] model on device ok", flush=True)
@@ -435,7 +431,10 @@ def eval_loop(args):
     model = build_model(args, info.kind)
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
-    model.to(info.device)
+    if info.kind == "npu":
+        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
+    else:
+        model.to(info.device)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})
     topk_list = [int(x) for x in args.topk.split(",") if x.strip()]
     beam = max(args.beam_size, max(topk_list))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -62,6 +62,96 @@ def synchronize(info: DeviceInfo) -> None:
 
 def amp_device_type(info: DeviceInfo) -> str:
     return info.kind if info.kind in {"cuda", "npu"} else "cpu"
+
+
+def prepare_npu_runtime(device_index: int = 0) -> None:
+    """Set device + disable JIT compile paths that often Abort on Ascend .to()."""
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        raise RuntimeError("NPU unavailable")
+    if hasattr(torch.npu, "set_compile_mode"):
+        try:
+            torch.npu.set_compile_mode(jit_compile=False)
+        except Exception:
+            pass
+    torch.npu.set_device(int(device_index))
+    torch.npu.synchronize()
+
+
+def _device_sync(device: torch.device) -> Optional[Callable[[], None]]:
+    if device.type == "npu":
+        return torch.npu.synchronize
+    if device.type == "cuda":
+        return torch.cuda.synchronize
+    return None
+
+
+def move_module_to_device_safe(
+    module: torch.nn.Module,
+    device: Union[torch.device, str],
+    *,
+    log: bool = False,
+    sync_each: bool = True,
+) -> torch.nn.Module:
+    """Move params/buffers once each (by object id).
+
+    HuggingFace T5 reuses the same ``shared`` Embedding under
+    ``encoder.embed_tokens`` / ``decoder.embed_tokens``. Recursive
+    ``Module.to(npu)`` therefore applies H2D twice on one module; some
+    torch_npu builds Abort there even when tiny Linear / basic ops work.
+
+    This helper walks unique Parameter/buffer storages only.
+    """
+    device = torch.device(device)
+    sync = _device_sync(device)
+    log_fn = print if log else (lambda *_a, **_k: None)
+
+    if device.type == "npu":
+        idx = device.index if device.index is not None else 0
+        prepare_npu_runtime(idx)
+
+    seen_param: set[int] = set()
+    n_moved = 0
+    for name, param in module.named_parameters(remove_duplicate=False):
+        pid = id(param)
+        if pid in seen_param:
+            continue
+        seen_param.add(pid)
+        if param.device == device:
+            continue
+        log_fn(f"[npu-move] param {name} shape={tuple(param.shape)} dtype={param.dtype}", flush=True)
+        with torch.no_grad():
+            param.data = param.data.to(device, non_blocking=False).contiguous()
+        n_moved += 1
+        if sync_each and sync is not None:
+            sync()
+
+    seen_buf: set[int] = set()
+    for name, buf in module.named_buffers(remove_duplicate=False):
+        if not torch.is_tensor(buf):
+            continue
+        bid = id(buf)
+        if bid in seen_buf:
+            continue
+        seen_buf.add(bid)
+        if buf.device == device:
+            continue
+        log_fn(f"[npu-move] buffer {name} shape={tuple(buf.shape)}", flush=True)
+        # Buffers live in module._buffers; replace via named path on parent.
+        parts = name.rsplit(".", 1)
+        if len(parts) == 1:
+            parent, bname = module, parts[0]
+        else:
+            parent = module.get_submodule(parts[0])
+            bname = parts[1]
+        parent._buffers[bname] = buf.to(device, non_blocking=False).contiguous()
+        n_moved += 1
+        if sync_each and sync is not None:
+            sync()
+
+    if sync is not None:
+        sync()
+    log_fn(f"[npu-move] done moved={n_moved} device={device}", flush=True)
+    return module
 
 
 def dataloader_kwargs(
