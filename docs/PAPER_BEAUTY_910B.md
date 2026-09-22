@@ -1,6 +1,6 @@
 # Paper-faithful TIGER Beauty on Ascend 910B
 
-对照论文 Rajput et al., *Recommender Systems with Generative Retrieval*（NeurIPS 2023）在 **Amazon Beauty** 上的训练/评测配方，便于在 910B 上测算吞吐与指标。
+> **保真度**：不能保证与论文 bit-exact。详见 **[FIDELITY_AND_910B_CLAIMS.md](FIDELITY_AND_910B_CLAIMS.md)**（什么对齐了、什么会偏、910B 结果怎么引用）。
 
 ## 论文配方（本仓 `--recipe paper`）
 
