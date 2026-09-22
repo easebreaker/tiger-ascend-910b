@@ -54,6 +54,11 @@ while [[ $# -gt 0 ]]; do
       python -u scripts/npu_xlt_probe.py
       exit 0
       ;;
+    --probe-model)
+      echo "[xlt-910b] running model.to(npu) probe"
+      python -u scripts/npu_model_to_probe.py
+      exit 0
+      ;;
     --skip-eval)
       SKIP_EVAL=1
       shift

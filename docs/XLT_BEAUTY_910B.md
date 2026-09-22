@@ -36,6 +36,14 @@ git log -1 --oneline
 # 1) 分步探测（最后一行 [probe N] 即崩溃点）
 bash scripts/run_xlt_beauty_910b.sh --probe
 
+# 1b) 若 probe 死在 matmul：先跑更细的基础探针
+export ASCEND_LAUNCH_BLOCKING=1
+python -u scripts/npu_basic_probe.py
+
+# 1c) basic 通过但 smoke 死在 model.to(npu)：
+python -u scripts/npu_model_to_probe.py
+# 看最后停在 m1 / m2 / m3
+
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke
 

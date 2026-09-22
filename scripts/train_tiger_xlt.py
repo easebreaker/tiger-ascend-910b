@@ -289,10 +289,22 @@ def train_loop(args):
 
     print("[step] build model", flush=True)
     model = build_model(args, info.kind)
-    print(f"[step] model.to({info.device})", flush=True)
-    model.to(info.device)
+    print(f"[step] set_device + model.to({info.device})", flush=True)
     if info.kind == "npu":
-        synchronize(info)
+        import torch
+
+        torch.npu.set_device(0)
+        torch.npu.synchronize()
+        print("[step] empty sync before to() ok", flush=True)
+        # Prefer .npu() then fall back to .to(); some torch_npu builds differ.
+        try:
+            model = model.npu()
+        except Exception as e:
+            print(f"[step] model.npu() failed ({e!r}), trying .to(npu:0)", flush=True)
+            model = model.to(info.device)
+        torch.npu.synchronize()
+    else:
+        model.to(info.device)
     print("[step] model on device ok", flush=True)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})
     grad_accum = max(1, args.grad_accum)
