@@ -8,10 +8,11 @@ from torch.utils.data import DataLoader
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from tiger_ascend.data.dataset import TigerSeqDataset, Trie, generate_toy_data, load_json
+from tiger_ascend.data.dataset import TigerSeqDataset, Trie, generate_toy_data, hash_user_token, load_json
 from tiger_ascend.data.tokenizer import SemanticIdTokenizer
-from tiger_ascend.model.tiger import TIGERModel, build_small_t5_config
+from tiger_ascend.model.tiger import TIGERModel, build_paper_t5_config, build_small_t5_config
 from tiger_ascend.utils.device import resolve_device
+from tiger_ascend.utils.metrics import PAPER_BEAUTY_METRICS, ndcg_at_k, summarize_ranking
 
 
 def test_cpu_forward_backward(tmp_path):
@@ -46,7 +47,6 @@ def test_leave_one_out_targets_disjoint(tmp_path):
     indices = load_json(str(indice))
     train_ds = TigerSeqDataset(inters, indices, max_his_len=20, mode="train")
     test_ds = TigerSeqDataset(inters, indices, max_his_len=20, mode="test")
-    # Per-user: test target is items[-1], never used as a train target (items[:-2] windows).
     for uid, items in train_ds.remapped_inters.items():
         train_targets = set(items[1:-2]) if len(items) > 3 else set()
         assert items[-1] not in train_targets
@@ -54,8 +54,20 @@ def test_leave_one_out_targets_disjoint(tmp_path):
     assert len(train_ds) > 0
 
 
+def test_user_hash_prefix(tmp_path):
+    inter = tmp_path / "inter.json"
+    indice = tmp_path / "semantic_ids.json"
+    generate_toy_data(str(inter), str(indice), num_users=4, num_items=16)
+    inters = load_json(str(inter))
+    indices = load_json(str(indice))
+    ds = TigerSeqDataset(inters, indices, max_his_len=10, mode="train", user_hash_size=2000)
+    sample = ds[0]["input_ids"]
+    assert sample.startswith("<u_")
+    assert any(t.startswith("<u_") for t in ds.get_new_tokens())
+    assert hash_user_token("7", 2000).startswith("<u_")
+
+
 def test_ce_and_token_acc_same_split_consistent(tmp_path):
-    """On one split, mean CE cannot be below (1-acc)*log(2)."""
     inter = tmp_path / "inter.json"
     indice = tmp_path / "semantic_ids.json"
     generate_toy_data(str(inter), str(indice), num_users=12, num_items=24)
@@ -123,3 +135,26 @@ def test_generate_decode_matches_label_format(tmp_path):
     assert gold.startswith("<") and ">" in gold
     assert all(p.startswith("<") for p in preds)
     assert all(p in set(ds.get_all_items(as_list=True)) for p in preds)
+
+
+def test_paper_config_near_13m():
+    extras = [f"<a_{i}>" for i in range(256)] + [f"<u_{i}>" for i in range(2000)]
+    tok = SemanticIdTokenizer(extras)
+    cfg = build_paper_t5_config(len(tok))
+    model = TIGERModel(cfg)
+    n = sum(p.numel() for p in model.parameters())
+    assert 10e6 < n < 20e6
+    assert cfg.d_model == 384 and cfg.num_layers == 4 and cfg.num_heads == 6
+
+
+def test_ndcg_and_paper_reference():
+    assert abs(ndcg_at_k(0, 5) - 1.0) < 1e-9
+    assert ndcg_at_k(None, 5) == 0.0
+    metrics = summarize_ranking(
+        ["a", "b"],
+        [["a", "x", "y"], ["z", "b", "y"]],
+        ks=[1, 2],
+    )
+    assert abs(metrics["recall@1"] - 0.5) < 1e-9
+    assert abs(metrics["recall@2"] - 1.0) < 1e-9
+    assert "recall@5" in PAPER_BEAUTY_METRICS

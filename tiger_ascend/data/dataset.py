@@ -1,6 +1,7 @@
 """Dataset + constrained decoding helpers for TIGER.
 
 Adapted from torch-rechub ``TigerSeqDataset`` / ``Trie`` utilities.
+Paper (Rajput et al.): optional hashed user-ID token prepended to history.
 """
 
 from __future__ import annotations
@@ -8,10 +9,19 @@ from __future__ import annotations
 import json
 import os
 import random
+import zlib
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import numpy as np
 from torch.utils.data import Dataset
+
+
+def hash_user_token(uid, user_hash_size: int) -> str:
+    """Stable hash into ``<u_0>..<u_{H-1}>`` (paper: H=2000)."""
+    if user_hash_size <= 0:
+        return ""
+    h = zlib.adler32(str(uid).encode("utf-8")) % int(user_hash_size)
+    return f"<u_{h}>"
 
 
 class TigerSeqDataset(Dataset):
@@ -24,11 +34,13 @@ class TigerSeqDataset(Dataset):
         max_his_len: int,
         mode: str = "train",
         sample_num: int = 0,
+        user_hash_size: int = 0,
     ):
         super().__init__()
         self.max_his_len = max_his_len
         self.sample_num = sample_num
         self.mode = mode
+        self.user_hash_size = int(user_hash_size)
         self._new_tokens: Optional[List[str]] = None
         self._all_items = None
         self.inters = inters_json
@@ -55,27 +67,45 @@ class TigerSeqDataset(Dataset):
             return history[-self.max_his_len :]
         return history
 
+    def _prefix_user(self, uid, history_text: str) -> str:
+        return hash_user_token(uid, self.user_hash_size) + history_text
+
     def _process_train_data(self):
         inter_data = []
-        for items in self.remapped_inters.values():
+        for uid, items in self.remapped_inters.items():
             items = items[:-2]
             for i in range(1, len(items)):
                 history = self._truncate_history(items[:i])
-                inter_data.append({"item": items[i], "inters": "".join(history)})
+                inter_data.append(
+                    {
+                        "item": items[i],
+                        "inters": self._prefix_user(uid, "".join(history)),
+                    }
+                )
         return inter_data
 
     def _process_valid_data(self):
         inter_data = []
-        for items in self.remapped_inters.values():
+        for uid, items in self.remapped_inters.items():
             history = self._truncate_history(items[:-2])
-            inter_data.append({"item": items[-2], "inters": "".join(history)})
+            inter_data.append(
+                {
+                    "item": items[-2],
+                    "inters": self._prefix_user(uid, "".join(history)),
+                }
+            )
         return inter_data
 
     def _process_test_data(self):
         inter_data = []
-        for items in self.remapped_inters.values():
+        for uid, items in self.remapped_inters.items():
             history = self._truncate_history(items[:-1])
-            inter_data.append({"item": items[-1], "inters": "".join(history)})
+            inter_data.append(
+                {
+                    "item": items[-1],
+                    "inters": self._prefix_user(uid, "".join(history)),
+                }
+            )
         if self.sample_num > 0:
             all_idx = np.arange(len(inter_data))
             sample_idx = np.random.choice(all_idx, self.sample_num, replace=False)
@@ -88,6 +118,8 @@ class TigerSeqDataset(Dataset):
         tokens: Set[str] = set()
         for index in self.indices.values():
             tokens.update(index)
+        if self.user_hash_size > 0:
+            tokens.update(f"<u_{i}>" for i in range(self.user_hash_size))
         self._new_tokens = sorted(tokens)
         return self._new_tokens
 

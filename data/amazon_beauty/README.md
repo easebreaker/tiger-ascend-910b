@@ -25,43 +25,24 @@
 - items: **12101**
 - 语义 ID：4 层 × codebook 0–255 → token 形如 `<a_12><b_3><c_40><d_7>`
 
-## 在 910B / 本仓上训练
+## 论文配方测算（推荐）
 
-先用子集冒烟：
+完整说明见 [`docs/PAPER_BEAUTY_910B.md`](../../docs/PAPER_BEAUTY_910B.md)。
 
 ```bash
-source .venv/bin/activate
-source /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env.sh
-export ASCEND_RT_VISIBLE_DEVICES=0
-
-python scripts/train_tiger.py \
-  --mode train \
-  --device npu \
-  --data_dir data/amazon_beauty/subset_512u \
-  --output_dir artifacts/ckpt_beauty_subset \
-  --epochs 3 \
-  --batch_size 16 \
-  --d_model 128 \
-  --num_layers 2 \
-  --num_heads 4
-
-python scripts/train_tiger.py \
-  --mode eval \
-  --device npu \
-  --data_dir data/amazon_beauty/subset_512u \
-  --output_dir artifacts/ckpt_beauty_subset
+bash scripts/run_paper_beauty_910b.sh
 ```
 
-全量 Beauty（更慢、占显存更多）：
+对照论文 Beauty：Recall@5=0.0454，NDCG@5=0.0321，Recall@10=0.0648，NDCG@10=0.0384。
+
+## 子集冒烟
 
 ```bash
 python scripts/train_tiger.py \
-  --mode train \
-  --device npu \
-  --data_dir data/amazon_beauty \
-  --output_dir artifacts/ckpt_beauty \
-  --epochs 5 \
-  --batch_size 32
+  --mode train --device npu \
+  --data_dir data/amazon_beauty/subset_512u \
+  --output_dir artifacts/ckpt_beauty_subset \
+  --epochs 3 --batch_size 16
 ```
 
 > 注意：不要对真实 `data_dir` 使用 `--mode all` / `toy`，那会覆盖 `inter.json`。

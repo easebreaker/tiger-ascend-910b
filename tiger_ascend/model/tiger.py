@@ -168,3 +168,20 @@ def build_small_t5_config(
         eos_token_id=1,
         decoder_start_token_id=0,
     )
+
+
+def build_paper_t5_config(vocab_size: int, dropout_rate: float = 0.1) -> T5Config:
+    """TIGER paper seq2seq size targeting ~13M parameters.
+
+    Paper: 4 enc/dec layers, 6 attention heads of dim 64 ⇒ d_model=384,
+    MLP (d_ff)=1024, dropout=0.1. (With SID+user vocab this lands ~14–15M.)
+    """
+    return build_small_t5_config(
+        vocab_size=vocab_size,
+        d_model=384,
+        d_ff=1024,
+        num_layers=4,
+        num_heads=6,
+        d_kv=64,
+        dropout_rate=dropout_rate,
+    )

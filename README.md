@@ -14,6 +14,7 @@ scripts/train_tiger.py        # toy / train / eval 入口
 scripts/convert_tiger_amazon_index.py
 docs/ASCEND_910B_ENV_AND_OPS.md
 docs/DEPLOY_STEP_BY_STEP_910B.md
+docs/PAPER_BEAUTY_910B.md
 ```
 
 ## 真实数据（Amazon Beauty）
@@ -37,27 +38,23 @@ python scripts/train_tiger.py --mode eval --device npu \
 
 ## 训练效率说明
 
-本仓默认是 **910B 跑通骨架**，不是论文吞吐配方。论文本身也写明 *optimizing computational efficiency was not the main objective*；没有单独的「训练加速算法」，慢主要来自：
-
-| 项 | 本仓默认（跑通） | 论文 / 实用建议 |
-|---|---|---|
-| 有效 batch | 8 | 256（可用 `--batch_size 64 --grad_accum 4`） |
-| 模型 | 2 层 d=128 | 4 层 × 6 head × d=384（`--paper_size`） |
-| AMP | 关 | 开 `--amp`（+ GradScaler） |
-| DataLoader | `num_workers=0` | `--num_workers 4` |
-| 评估 | 全量 Trie beam | 训练期最耗时；需要时再 `--mode eval` |
-
-后续社区加速（**不是原论文**）：rk-means 换 RQ-VAE、SID-MLP 蒸馏推理等，本仓未接入。
-
-910B 建议起步：
+本仓默认是 **910B 跑通骨架**（`--recipe smoke`）。要按论文配方在 Beauty 上测算，用：
 
 ```bash
-python scripts/train_tiger.py --mode train --device npu \
-  --data_dir data/amazon_beauty/subset_512u \
-  --output_dir artifacts/ckpt_beauty_subset \
-  --epochs 30 --batch_size 64 --grad_accum 4 \
-  --amp --num_workers 4 --paper_size --lr 1e-3
+bash scripts/run_paper_beauty_910b.sh
+# 详见 docs/PAPER_BEAUTY_910B.md
 ```
+
+论文本身没有单独的「训练加速算法」；本仓 paper recipe 还原的是：**200k step、eff_batch=256、inv-sqrt LR、user hash、~13M T5、Recall/NDCG@5/10**。工程侧另加 AMP / DataLoader workers / grad accum。
+
+| 项 | smoke 默认 | `--recipe paper` |
+|---|---|---|
+| 有效 batch | 8 | 256（64×4） |
+| 模型 | 2 层 d=128 | 4 层 d=384（~14M） |
+| 步数 | 少数 epoch | 200k |
+| AMP / workers | 关 / 0 | 开 / 4 |
+
+后续社区加速（rk-means、SID-MLP）未接入。
 
 ## 指标怎么读（loss ↓ 但 Hit@K≈0）
 
