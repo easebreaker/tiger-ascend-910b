@@ -64,8 +64,28 @@ def amp_device_type(info: DeviceInfo) -> str:
     return info.kind if info.kind in {"cuda", "npu"} else "cpu"
 
 
-def dataloader_kwargs(info: DeviceInfo, num_workers: int = 0) -> dict:
-    return {
-        "num_workers": num_workers,
+def dataloader_kwargs(
+    info: DeviceInfo,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
+) -> dict:
+    """DataLoader kwargs tuned for accelerator host/device overlap.
+
+    Default ``num_workers=0`` is safest for smoke tests; pass ``>=2`` for real runs.
+    ``pin_memory`` helps CUDA; Ascend often prefers ``False`` (H2D path differs).
+    """
+    kwargs = {
+        "num_workers": max(0, int(num_workers)),
         "pin_memory": info.kind == "cuda",
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+    return kwargs
+
+
+def move_batch_to_device(batch: dict, device: torch.device, non_blocking: bool = True) -> dict:
+    return {
+        k: (v.to(device, non_blocking=non_blocking) if torch.is_tensor(v) else v)
+        for k, v in batch.items()
     }

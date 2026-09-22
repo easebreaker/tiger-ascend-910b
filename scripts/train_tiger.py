@@ -21,6 +21,7 @@ from tiger_ascend.model.tiger import TIGERModel, build_small_t5_config  # noqa: 
 from tiger_ascend.utils.device import (  # noqa: E402
     amp_device_type,
     dataloader_kwargs,
+    move_batch_to_device,
     resolve_device,
     synchronize,
 )
@@ -34,6 +35,13 @@ def parse_args():
     p.add_argument("--output_dir", default="./artifacts/ckpt")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument(
+        "--grad_accum",
+        type=int,
+        default=1,
+        help="accumulate this many micro-batches before optimizer step "
+        "(effective batch = batch_size * grad_accum)",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--max_his_len", type=int, default=20)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -51,8 +59,34 @@ def parse_args():
     p.add_argument("--d_model", type=int, default=128)
     p.add_argument("--num_layers", type=int, default=2)
     p.add_argument("--num_heads", type=int, default=4)
-    p.add_argument("--amp", action="store_true")
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="enable autocast fp16 + GradScaler on cuda/npu (recommended for real runs)",
+    )
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader workers; use 2–8 on 910B for real data (0 is safest for smoke)",
+    )
+    p.add_argument(
+        "--paper_size",
+        action="store_true",
+        help="use paper-ish T5 size: 4 layers, 6 heads, d_model=384 (still not full 200k-step recipe)",
+    )
     return p.parse_args()
+
+
+def apply_size_preset(args):
+    if args.paper_size:
+        args.d_model = 384
+        args.num_layers = 4
+        args.num_heads = 6
+        print(
+            f"[preset] paper_size d_model={args.d_model} "
+            f"layers={args.num_layers} heads={args.num_heads}"
+        )
 
 
 def inter_path(data_dir: str) -> str:
@@ -61,23 +95,6 @@ def inter_path(data_dir: str) -> str:
 
 def indice_path(data_dir: str) -> str:
     return os.path.join(data_dir, "semantic_ids.json")
-
-
-def build_model(train_ds: TigerSeqDataset, args):
-    tok = SemanticIdTokenizer(train_ds.get_new_tokens(), model_max_length=256)
-    cfg = build_small_t5_config(
-        vocab_size=len(tok),
-        d_model=args.d_model,
-        d_ff=args.d_model * 2,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-    )
-    cfg.pad_token_id = tok.pad_token_id
-    cfg.eos_token_id = tok.eos_token_id
-    cfg.decoder_start_token_id = tok.pad_token_id
-    model = TIGERModel(cfg)
-    model.set_hyper(args.temperature)
-    return tok, model
 
 
 def _validate_json_alignment(inters, indices):
@@ -97,6 +114,41 @@ def _validate_json_alignment(inters, indices):
         )
 
 
+def build_model(train_ds: TigerSeqDataset, args):
+    tok = SemanticIdTokenizer(train_ds.get_new_tokens(), model_max_length=256)
+    d_kv = max(16, args.d_model // max(1, args.num_heads))
+    d_ff = args.d_model * (4 if args.paper_size else 2)
+    cfg = build_small_t5_config(
+        vocab_size=len(tok),
+        d_model=args.d_model,
+        d_ff=d_ff,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        d_kv=d_kv,
+    )
+    cfg.pad_token_id = tok.pad_token_id
+    cfg.eos_token_id = tok.eos_token_id
+    cfg.decoder_start_token_id = tok.pad_token_id
+    model = TIGERModel(cfg)
+    model.set_hyper(args.temperature)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"[model] params={n_params / 1e6:.2f}M vocab={len(tok)} "
+        f"d_model={args.d_model} layers={args.num_layers} heads={args.num_heads} d_ff={d_ff}"
+    )
+    return tok, model
+
+
+def _make_grad_scaler(info, enabled: bool):
+    if not enabled or info.kind not in {"cuda", "npu"}:
+        return None
+    # torch.amp.GradScaler works for cuda; npu backends expose the same API when available.
+    try:
+        return torch.amp.GradScaler(device=info.kind, enabled=True)
+    except TypeError:
+        return torch.cuda.amp.GradScaler(enabled=info.kind == "cuda")
+
+
 def train_loop(args):
     info = resolve_device(args.device)
     print(f"[device] kind={info.kind} device={info.device} count={info.device_count}")
@@ -113,37 +165,61 @@ def train_loop(args):
     tok, model = build_model(train_ds, args)
     model.to(info.device)
 
+    use_amp = bool(args.amp and info.kind in {"cuda", "npu"})
+    scaler = _make_grad_scaler(info, use_amp)
+    grad_accum = max(1, int(args.grad_accum))
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=train_ds.get_collate_fn(tok),
-        **dataloader_kwargs(info),
+        **dataloader_kwargs(info, num_workers=args.num_workers),
     )
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    total_steps = max(1, len(loader) * args.epochs)
+    updates_per_epoch = max(1, (len(loader) + grad_accum - 1) // grad_accum)
+    total_steps = max(1, updates_per_epoch * args.epochs)
     sched = get_linear_schedule_with_warmup(optim, int(0.05 * total_steps), total_steps)
+    print(
+        f"[train] samples={len(train_ds)} batches/epoch={len(loader)} "
+        f"batch_size={args.batch_size} grad_accum={grad_accum} "
+        f"eff_batch={args.batch_size * grad_accum} amp={use_amp} "
+        f"num_workers={args.num_workers}"
+    )
 
     model.train()
+    non_blocking = info.kind in {"cuda", "npu"}
     for epoch in range(args.epochs):
-        running, steps = 0.0, 0
-        for batch in loader:
-            batch = {k: v.to(info.device) for k, v in batch.items()}
-            optim.zero_grad(set_to_none=True)
-            if args.amp and info.kind in {"cuda", "npu"}:
+        # Accumulate on-device to avoid per-step H2D sync from float(loss.cpu()).
+        running_t = torch.zeros((), device=info.device)
+        steps = 0
+        optim.zero_grad(set_to_none=True)
+        for step_i, batch in enumerate(loader, start=1):
+            batch = move_batch_to_device(batch, info.device, non_blocking=non_blocking)
+            if use_amp:
                 with torch.autocast(device_type=amp_device_type(info), dtype=torch.float16):
-                    loss = model(**batch).loss
-                loss.backward()
+                    loss = model(**batch).loss / grad_accum
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
             else:
-                loss = model(**batch).loss
+                loss = model(**batch).loss / grad_accum
                 loss.backward()
-            optim.step()
-            sched.step()
-            running += float(loss.detach().cpu())
+
+            running_t = running_t + loss.detach()
             steps += 1
+            if step_i % grad_accum == 0 or step_i == len(loader):
+                if scaler is not None:
+                    scaler.step(optim)
+                    scaler.update()
+                else:
+                    optim.step()
+                sched.step()
+                optim.zero_grad(set_to_none=True)
         synchronize(info)
+        # running_t summed (loss/grad_accum); report mean micro-batch CE
         print(
-            f"epoch={epoch + 1} train_loss={running / max(1, steps):.4f} "
+            f"epoch={epoch + 1} train_loss={float(running_t) / max(1, steps) * grad_accum:.4f} "
             f"valid_size={len(valid_ds)}"
         )
 
@@ -186,7 +262,7 @@ def _teacher_forcing_stats(
     for bi, batch in enumerate(loader):
         if bi >= max_batches:
             break
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = move_batch_to_device(batch, device, non_blocking=True)
         labels = batch["labels"]
         out = model(**batch)
         loss_sum += float(out.loss.detach().cpu())
@@ -277,12 +353,14 @@ def eval_loop(args):
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=train_ds.get_collate_fn(tok),
+        **dataloader_kwargs(info, num_workers=args.num_workers),
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=test_ds.get_collate_fn(tok),
+        **dataloader_kwargs(info, num_workers=args.num_workers),
     )
     # Compare splits: train loss≈train TF ce; test TF acc<<train ⇒ overfit / LOO, not CE bug.
     train_stats = _teacher_forcing_stats(
@@ -308,7 +386,7 @@ def eval_loop(args):
     for batch in test_loader:
         labels = batch.pop("labels")
         bsz = labels.size(0)
-        batch = {k: v.to(info.device) for k, v in batch.items()}
+        batch = move_batch_to_device(batch, info.device, non_blocking=True)
         gen = model.generate(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -344,6 +422,7 @@ def eval_loop(args):
 
 def main():
     args = parse_args()
+    apply_size_preset(args)
     if args.mode in {"toy", "all"}:
         generate_toy_data(
             inter_path(args.data_dir),

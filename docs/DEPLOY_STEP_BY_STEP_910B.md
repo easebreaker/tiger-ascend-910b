@@ -143,6 +143,19 @@ python3 scripts/train_tiger.py --mode all --device npu --epochs 2 --batch_size 8
 
 若 `--amp` 报错，先去掉，用 FP32 跑通。
 
+**吞吐提示（默认配置偏“跑通”不是论文 batch）：**
+
+```bash
+# Beauty subset 更接近实用吞吐
+python3 scripts/train_tiger.py --mode train --device npu \
+  --data_dir data/amazon_beauty/subset_512u \
+  --output_dir artifacts/ckpt_beauty_subset \
+  --epochs 30 --batch_size 64 --grad_accum 4 \
+  --amp --num_workers 4 --paper_size
+```
+
+论文没有单独的训练加速方案；beam search 评估才是原作者承认的慢点。本仓慢主要是小 batch / 无 AMP / `num_workers=0` / 每步 host sync（已缓解）。
+
 ---
 
 ## 6. 换成你自己的数据（第二阶段）
