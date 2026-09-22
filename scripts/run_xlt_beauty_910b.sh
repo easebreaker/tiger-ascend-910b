@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # XiaoLongtaoo/TIGER-aligned Beauty on Ascend 910B.
-# Upstream Beauty: R@5=0.0392 N@5=0.0257 R@10=0.0594 N@10=0.0321
 #
-# NPU tip: default num_workers=0 (workers>0 often causes "Aborted" with torch_npu).
-# Smoke:  bash scripts/run_xlt_beauty_910b.sh --smoke
-# Full:   bash scripts/run_xlt_beauty_910b.sh
-# OOM:    bash scripts/run_xlt_beauty_910b.sh --batch_size 32 --grad_accum 8
+# Smoke (subset + probe-friendly):
+#   bash scripts/run_xlt_beauty_910b.sh --smoke
+# Isolate crash step:
+#   python -u scripts/npu_xlt_probe.py
+# Full:
+#   bash scripts/run_xlt_beauty_910b.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -23,29 +24,35 @@ elif [[ -f /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env
 fi
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
-# Avoid tokenizer/thread forks fighting NPU runtime
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 OUT="${OUT_DIR:-artifacts/ckpt_beauty_xlt}"
 DATA="${DATA_DIR:-data/amazon_beauty}"
-# 0 is safest on Ascend; set NUM_WORKERS=2 only after smoke passes
 NUM_WORKERS="${NUM_WORKERS:-0}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 INFER_BS="${INFER_BATCH_SIZE:-32}"
+LAYOUT="${LAYOUT:-npu_safe}"
 SKIP_EVAL=0
 EXTRA=()
 
-# Parse leading --smoke; remaining args go to python
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --smoke)
-      BATCH_SIZE=8
+      DATA="${SMOKE_DATA:-data/amazon_beauty/subset_512u}"
+      OUT="${OUT_DIR:-artifacts/ckpt_beauty_xlt_smoke}"
+      BATCH_SIZE=2
       GRAD_ACCUM=1
-      INFER_BS=8
-      EXTRA+=(--max_train_steps 20 --skip_valid --epochs 1 --batch_size 8 --grad_accum 1)
+      INFER_BS=2
+      LAYOUT=npu_safe
+      EXTRA+=(--max_train_steps 10 --skip_valid --epochs 1 --batch_size 2 --grad_accum 1 --layout npu_safe)
       SKIP_EVAL=1
       shift
+      ;;
+    --probe)
+      echo "[xlt-910b] running NPU probe (last [probe N] = crash site)"
+      python -u scripts/npu_xlt_probe.py
+      exit 0
       ;;
     --skip-eval)
       SKIP_EVAL=1
@@ -58,7 +65,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "[xlt-910b] device=npu workers=${NUM_WORKERS} batch=${BATCH_SIZE} accum=${GRAD_ACCUM} out=${OUT}"
+echo "[xlt-910b] sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "[xlt-910b] data=${DATA} layout=${LAYOUT} workers=${NUM_WORKERS} batch=${BATCH_SIZE} accum=${GRAD_ACCUM}"
+
 python -u scripts/train_tiger_xlt.py \
   --mode train \
   --device npu \
@@ -72,6 +81,7 @@ python -u scripts/train_tiger_xlt.py \
   --early_stop 10 \
   --lr 1e-4 \
   --num_workers "${NUM_WORKERS}" \
+  --layout "${LAYOUT}" \
   "${EXTRA[@]+"${EXTRA[@]}"}"
 
 if [[ "${SKIP_EVAL}" -eq 1 ]]; then
@@ -87,6 +97,7 @@ python -u scripts/train_tiger_xlt.py \
   --output_dir "${OUT}" \
   --infer_batch_size "${INFER_BS}" \
   --beam_size 30 \
-  --num_workers "${NUM_WORKERS}"
+  --num_workers "${NUM_WORKERS}" \
+  --layout "${LAYOUT}"
 
 echo "[xlt-910b] ${OUT}/eval_metrics.json"

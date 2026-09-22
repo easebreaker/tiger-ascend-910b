@@ -191,20 +191,24 @@ def build_xlt_t5_config(
     vocab_size: int = 1025,
     dropout_rate: float = 0.1,
     *,
-    exact_xlt: bool = True,
+    layout: str = "xlt",
     use_cache: bool = False,
 ) -> T5Config:
-    """XiaoLongtaoo/TIGER defaults.
+    """XiaoLongtaoo/TIGER-related T5 configs.
 
-    exact_xlt=True: d_model=128, heads=6, d_kv=64 (inner_dim=384 ≠ d_model).
-    On Ascend, fused attention may stack-smash with that layout — use
-    exact_xlt=False (d_model=384) so d_model == heads * d_kv.
+    layout:
+      - ``xlt``: upstream 128/6/64 (inner_dim 384 ≠ d_model; can smash Ascend MHA)
+      - ``npu_safe``: 128/4/32 so d_model == heads*d_kv, similar param count
+      - ``npu_large``: 384/6/64 (paper head geometry, ~14M)
     """
-    if exact_xlt:
-        d_model, d_ff, d_kv, num_heads = 128, 1024, 64, 6
-    else:
-        # NPU-safe: match paper head geometry while keeping d_ff / depth
-        d_model, d_ff, d_kv, num_heads = 384, 1024, 64, 6
+    layouts = {
+        "xlt": (128, 1024, 64, 6),
+        "npu_safe": (128, 1024, 32, 4),
+        "npu_large": (384, 1024, 64, 6),
+    }
+    if layout not in layouts:
+        raise ValueError(f"unknown layout={layout}, choose from {list(layouts)}")
+    d_model, d_ff, d_kv, num_heads = layouts[layout]
     return T5Config(
         vocab_size=vocab_size,
         d_model=d_model,

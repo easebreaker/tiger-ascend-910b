@@ -72,12 +72,18 @@ def parse_args():
     p.add_argument(
         "--xlt_exact_dims",
         action="store_true",
-        help="force upstream d_model=128/heads=6/d_kv=64 (may stack-smash on Ascend)",
+        help="force upstream 128/6/64 (unsafe on many Ascend builds)",
     )
     p.add_argument(
         "--npu_head_align",
         action="store_true",
-        help="d_model=384 so d_model==heads*d_kv (recommended on 910B)",
+        help="alias: use npu_safe layout (128/4/32)",
+    )
+    p.add_argument(
+        "--layout",
+        choices=["xlt", "npu_safe", "npu_large"],
+        default=None,
+        help="model geometry; NPU defaults to npu_safe",
     )
     return p.parse_args()
 
@@ -96,6 +102,19 @@ def indice_path(d):
     return os.path.join(d, "semantic_ids.json")
 
 
+def _git_sha() -> str:
+    try:
+        import subprocess
+
+        return (
+            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
 def _force_eager_attention(model) -> None:
     """Disable fused/SDPA attention paths that break on some Ascend builds."""
     cfg = model.config
@@ -111,19 +130,30 @@ def _force_eager_attention(model) -> None:
             module.config._attn_implementation = "eager"
 
 
-def build_model(args, device_kind: str):
-    # Ascend fused MHA often assumes d_model == num_heads * d_kv.
-    # XLT uses 128 vs 6*64=384 → can "*** stack smashing detected ***".
+def _resolve_layout(args, device_kind: str) -> str:
+    if args.layout:
+        return args.layout
     if args.xlt_exact_dims:
-        exact = True
-    elif args.npu_head_align or device_kind == "npu":
-        exact = False
-    else:
-        exact = True
+        return "xlt"
+    if args.npu_head_align:
+        return "npu_safe"
+    if device_kind == "npu":
+        return "npu_safe"
+    return "xlt"
+
+
+def build_model(args, device_kind: str):
+    layout = _resolve_layout(args, device_kind)
+    if device_kind == "npu" and layout == "xlt":
+        print(
+            "[npu] WARNING: layout=xlt (128/6/64) often Aborts on Ascend; "
+            "prefer default npu_safe",
+            flush=True,
+        )
     cfg = build_xlt_t5_config(
         vocab_size=XLT_VOCAB_SIZE,
         dropout_rate=0.1,
-        exact_xlt=exact,
+        layout=layout,
         use_cache=False,
     )
     try:
@@ -133,16 +163,12 @@ def build_model(args, device_kind: str):
     _force_eager_attention(model)
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
-        f"[xlt-model] params={n / 1e6:.2f}M vocab={cfg.vocab_size} "
-        f"d_model={cfg.d_model} d_ff={cfg.d_ff} layers={cfg.num_layers} "
-        f"heads={cfg.num_heads} d_kv={cfg.d_kv} exact_xlt={exact} "
-        f"attn=eager use_cache={cfg.use_cache}"
+        f"[xlt-model] sha={_git_sha()} params={n / 1e6:.2f}M vocab={cfg.vocab_size} "
+        f"layout={layout} d_model={cfg.d_model} d_ff={cfg.d_ff} layers={cfg.num_layers} "
+        f"heads={cfg.num_heads} d_kv={cfg.d_kv} "
+        f"aligned={cfg.d_model == cfg.num_heads * cfg.d_kv} attn=eager",
+        flush=True,
     )
-    if device_kind == "npu" and not exact:
-        print(
-            "[npu] using head-aligned d_model=384 to avoid Ascend stack-smash "
-            "with XLT's 128≠6*64 layout; pass --xlt_exact_dims to force upstream dims"
-        )
     return model
 
 
@@ -250,30 +276,36 @@ def _write_metrics(args, metrics, n_test, tag="eval"):
 
 def train_loop(args):
     info = resolve_device(args.device)
-    print(f"[device] kind={info.kind} device={info.device}")
+    print(f"[device] kind={info.kind} device={info.device} sha={_git_sha()}", flush=True)
     set_seed(args.seed)
+    print("[step] load json", flush=True)
     inters = load_json(inter_path(args.data_dir))
     indices = load_json(indice_path(args.data_dir))
+    print("[step] build datasets", flush=True)
     train_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="train")
     valid_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="valid")
     test_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="test")
-    print(f"[data] train={len(train_ds)} valid={len(valid_ds)} test={len(test_ds)}")
+    print(f"[data] train={len(train_ds)} valid={len(valid_ds)} test={len(test_ds)}", flush=True)
 
+    print("[step] build model", flush=True)
     model = build_model(args, info.kind)
+    print(f"[step] model.to({info.device})", flush=True)
     model.to(info.device)
+    if info.kind == "npu":
+        synchronize(info)
+    print("[step] model on device ok", flush=True)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})
     grad_accum = max(1, args.grad_accum)
-    if info.kind == "npu" and args.batch_size >= 64 and not args.xlt_exact_dims:
-        print(
-            "[npu] tip: head-aligned model is larger (~14M); "
-            "if OOM use --batch_size 32 --grad_accum 8"
-        )
+    if info.kind == "npu" and args.batch_size >= 64:
+        print("[npu] tip: if Aborted/OOM try --batch_size 8 --grad_accum 32", flush=True)
     if args.batch_size * grad_accum < 256:
         print(
             f"[warn] eff_batch={args.batch_size * grad_accum} < 256 "
-            f"(upstream default); raise --batch_size/--grad_accum if possible"
+            f"(upstream default); raise --batch_size/--grad_accum if possible",
+            flush=True,
         )
 
+    print("[step] build dataloader", flush=True)
     loader = _make_loader(train_ds, args.batch_size, True, info, args.num_workers)
     valid_loader = _make_loader(valid_ds, args.infer_batch_size, False, info, args.num_workers)
     test_loader = _make_loader(test_ds, args.infer_batch_size, False, info, args.num_workers)
@@ -287,6 +319,7 @@ def train_loop(args):
     os.makedirs(args.output_dir, exist_ok=True)
     best_path = os.path.join(args.output_dir, "pytorch_model.bin")
 
+    print("[step] enter train loop", flush=True)
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
@@ -294,7 +327,16 @@ def train_loop(args):
         optim.zero_grad(set_to_none=True)
         t0 = time.time()
         for step_i, batch in enumerate(loader, start=1):
+            if global_step == 0 and micro == 0:
+                print(
+                    f"[step] first batch shapes "
+                    f"input={tuple(batch['input_ids'].shape)} "
+                    f"labels={tuple(batch['labels'].shape)}",
+                    flush=True,
+                )
             batch = move_batch_to_device(batch, info.device, non_blocking=True)
+            if global_step == 0 and micro == 0:
+                print("[step] first forward", flush=True)
             if use_amp:
                 with torch.autocast(device_type=amp_device_type(info), dtype=torch.float16):
                     loss = model(**batch).loss / grad_accum
@@ -302,6 +344,14 @@ def train_loop(args):
             else:
                 loss = model(**batch).loss / grad_accum
                 loss.backward()
+            if global_step == 0 and micro == 0:
+                if info.kind == "npu":
+                    synchronize(info)
+                print(
+                    f"[step] first forward+backward ok "
+                    f"loss={float(loss.detach()) * grad_accum:.4f}",
+                    flush=True,
+                )
             running += float(loss.detach()) * grad_accum
             micro += 1
             if step_i % grad_accum == 0:
@@ -309,7 +359,11 @@ def train_loop(args):
                 optim.zero_grad(set_to_none=True)
                 global_step += 1
                 if global_step % args.log_every == 0:
-                    print(f"epoch={epoch} step={global_step} loss={running / max(1, micro):.4f}")
+                    print(
+                        f"epoch={epoch} step={global_step} "
+                        f"loss={running / max(1, micro):.4f}",
+                        flush=True,
+                    )
                 if args.max_train_steps > 0 and global_step >= args.max_train_steps:
                     break
         synchronize(info)

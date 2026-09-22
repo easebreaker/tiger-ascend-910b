@@ -30,27 +30,21 @@
 ## 910B
 
 ```bash
-# 冒烟（推荐先跑；workers=0，小 batch）
+# 0) 先确认 commit（日志会打印 sha=... layout=npu_safe）
+git log -1 --oneline
+
+# 1) 分步探测（最后一行 [probe N] 即崩溃点）
+bash scripts/run_xlt_beauty_910b.sh --probe
+
+# 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke
 
-# 正式
+# 3) 正式全量
 bash scripts/run_xlt_beauty_910b.sh
-
-# OOM
-BATCH_SIZE=32 GRAD_ACCUM=8 bash scripts/run_xlt_beauty_910b.sh
 ```
 
-若出现 `Aborted` / `stack smashing detected`：
+**重要：** 若日志仍是 `params=4.59M` 且 `d_model=128 heads=6 d_kv=64`，说明还在跑旧代码/旧 layout（`128≠6*64`）。新版本应看到：
 
-1. 已默认在 NPU 上改用 **head-aligned**（`d_model=384 = 6×64`），避免 XLT 的 `128≠6*64` 触发昇腾融合注意力炸栈。  
-2. 确认 `num_workers=0`（脚本默认）。  
-3. 仍炸时：
+`layout=npu_safe d_model=128 heads=4 d_kv=32 aligned=True`
 
-```bash
-export ASCEND_LAUNCH_BLOCKING=1
-bash scripts/run_xlt_beauty_910b.sh --smoke
-```
-
-冒烟通过后正式训；OOM 则 `BATCH_SIZE=32 GRAD_ACCUM=8 bash scripts/run_xlt_beauty_910b.sh`。
-
-结果：`artifacts/ckpt_beauty_xlt/eval_metrics.json`
+`stack smashing` / 无堆栈 `Aborted`：先跑 `--probe`，把完整输出贴回。
