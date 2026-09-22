@@ -40,11 +40,17 @@ bash scripts/run_xlt_beauty_910b.sh
 BATCH_SIZE=32 GRAD_ACCUM=8 bash scripts/run_xlt_beauty_910b.sh
 ```
 
-若出现 `Aborted`（无 Python traceback）：几乎总是 **NPU + DataLoader `num_workers>0`**。本脚本默认 `NUM_WORKERS=0`；确认 CANN/`set_env.sh` 已 source。调试可加：
+若出现 `Aborted` / `stack smashing detected`：
+
+1. 已默认在 NPU 上改用 **head-aligned**（`d_model=384 = 6×64`），避免 XLT 的 `128≠6*64` 触发昇腾融合注意力炸栈。  
+2. 确认 `num_workers=0`（脚本默认）。  
+3. 仍炸时：
 
 ```bash
 export ASCEND_LAUNCH_BLOCKING=1
 bash scripts/run_xlt_beauty_910b.sh --smoke
 ```
+
+冒烟通过后正式训；OOM 则 `BATCH_SIZE=32 GRAD_ACCUM=8 bash scripts/run_xlt_beauty_910b.sh`。
 
 结果：`artifacts/ckpt_beauty_xlt/eval_metrics.json`

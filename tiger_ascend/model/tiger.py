@@ -187,22 +187,38 @@ def build_paper_t5_config(vocab_size: int, dropout_rate: float = 0.1) -> T5Confi
     )
 
 
-def build_xlt_t5_config(vocab_size: int = 1025, dropout_rate: float = 0.1) -> T5Config:
-    """XiaoLongtaoo/TIGER ``model/main.py`` defaults (d_model=128)."""
+def build_xlt_t5_config(
+    vocab_size: int = 1025,
+    dropout_rate: float = 0.1,
+    *,
+    exact_xlt: bool = True,
+    use_cache: bool = False,
+) -> T5Config:
+    """XiaoLongtaoo/TIGER defaults.
+
+    exact_xlt=True: d_model=128, heads=6, d_kv=64 (inner_dim=384 ≠ d_model).
+    On Ascend, fused attention may stack-smash with that layout — use
+    exact_xlt=False (d_model=384) so d_model == heads * d_kv.
+    """
+    if exact_xlt:
+        d_model, d_ff, d_kv, num_heads = 128, 1024, 64, 6
+    else:
+        # NPU-safe: match paper head geometry while keeping d_ff / depth
+        d_model, d_ff, d_kv, num_heads = 384, 1024, 64, 6
     return T5Config(
         vocab_size=vocab_size,
-        d_model=128,
-        d_ff=1024,
-        d_kv=64,
+        d_model=d_model,
+        d_ff=d_ff,
+        d_kv=d_kv,
         num_layers=4,
         num_decoder_layers=4,
-        num_heads=6,
+        num_heads=num_heads,
         dropout_rate=dropout_rate,
         layer_norm_epsilon=1e-6,
         initializer_factor=1.0,
         feed_forward_proj="relu",
         is_encoder_decoder=True,
-        use_cache=True,
+        use_cache=use_cache,
         pad_token_id=0,
         eos_token_id=0,
         decoder_start_token_id=0,

@@ -185,8 +185,10 @@ def test_xlt_config_size():
 
     from tiger_ascend.model.tiger import build_xlt_t5_config
 
-    cfg = build_xlt_t5_config(1025)
+    cfg = build_xlt_t5_config(1025, exact_xlt=True)
     model = T5ForConditionalGeneration(cfg)
     n = sum(p.numel() for p in model.parameters())
     assert cfg.d_model == 128 and cfg.d_ff == 1024 and cfg.eos_token_id == 0
     assert 3e6 < n < 8e6
+    cfg2 = build_xlt_t5_config(1025, exact_xlt=False)
+    assert cfg2.d_model == 384 and cfg2.num_heads * cfg2.d_kv == cfg2.d_model

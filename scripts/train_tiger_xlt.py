@@ -69,6 +69,16 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--max_train_steps", type=int, default=0, help=">0 for smoke")
     p.add_argument("--skip_valid", action="store_true")
+    p.add_argument(
+        "--xlt_exact_dims",
+        action="store_true",
+        help="force upstream d_model=128/heads=6/d_kv=64 (may stack-smash on Ascend)",
+    )
+    p.add_argument(
+        "--npu_head_align",
+        action="store_true",
+        help="d_model=384 so d_model==heads*d_kv (recommended on 910B)",
+    )
     return p.parse_args()
 
 
@@ -86,15 +96,53 @@ def indice_path(d):
     return os.path.join(d, "semantic_ids.json")
 
 
-def build_model():
-    cfg = build_xlt_t5_config(vocab_size=XLT_VOCAB_SIZE, dropout_rate=0.1)
-    model = T5ForConditionalGeneration(cfg)
+def _force_eager_attention(model) -> None:
+    """Disable fused/SDPA attention paths that break on some Ascend builds."""
+    cfg = model.config
+    if hasattr(cfg, "_attn_implementation"):
+        cfg._attn_implementation = "eager"
+    if hasattr(model, "set_attn_implementation"):
+        try:
+            model.set_attn_implementation("eager")
+        except Exception:
+            pass
+    for module in model.modules():
+        if hasattr(module, "config") and hasattr(module.config, "_attn_implementation"):
+            module.config._attn_implementation = "eager"
+
+
+def build_model(args, device_kind: str):
+    # Ascend fused MHA often assumes d_model == num_heads * d_kv.
+    # XLT uses 128 vs 6*64=384 → can "*** stack smashing detected ***".
+    if args.xlt_exact_dims:
+        exact = True
+    elif args.npu_head_align or device_kind == "npu":
+        exact = False
+    else:
+        exact = True
+    cfg = build_xlt_t5_config(
+        vocab_size=XLT_VOCAB_SIZE,
+        dropout_rate=0.1,
+        exact_xlt=exact,
+        use_cache=False,
+    )
+    try:
+        model = T5ForConditionalGeneration(cfg, attn_implementation="eager")
+    except TypeError:
+        model = T5ForConditionalGeneration(cfg)
+    _force_eager_attention(model)
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"[xlt-model] params={n / 1e6:.2f}M vocab={cfg.vocab_size} "
         f"d_model={cfg.d_model} d_ff={cfg.d_ff} layers={cfg.num_layers} "
-        f"heads={cfg.num_heads} d_kv={cfg.d_kv}"
+        f"heads={cfg.num_heads} d_kv={cfg.d_kv} exact_xlt={exact} "
+        f"attn=eager use_cache={cfg.use_cache}"
     )
+    if device_kind == "npu" and not exact:
+        print(
+            "[npu] using head-aligned d_model=384 to avoid Ascend stack-smash "
+            "with XLT's 128≠6*64 layout; pass --xlt_exact_dims to force upstream dims"
+        )
     return model
 
 
@@ -211,10 +259,15 @@ def train_loop(args):
     test_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="test")
     print(f"[data] train={len(train_ds)} valid={len(valid_ds)} test={len(test_ds)}")
 
-    model = build_model()
+    model = build_model(args, info.kind)
     model.to(info.device)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})
     grad_accum = max(1, args.grad_accum)
+    if info.kind == "npu" and args.batch_size >= 64 and not args.xlt_exact_dims:
+        print(
+            "[npu] tip: head-aligned model is larger (~14M); "
+            "if OOM use --batch_size 32 --grad_accum 8"
+        )
     if args.batch_size * grad_accum < 256:
         print(
             f"[warn] eff_batch={args.batch_size * grad_accum} < 256 "
@@ -313,7 +366,7 @@ def eval_loop(args):
     inters = load_json(inter_path(args.data_dir))
     indices = load_json(indice_path(args.data_dir))
     test_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="test")
-    model = build_model()
+    model = build_model(args, info.kind)
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
     model.to(info.device)
