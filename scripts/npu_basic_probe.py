@@ -41,10 +41,20 @@ def main() -> None:
     if not ok:
         raise SystemExit("NPU not available — check driver/CANN/set_env.sh")
 
-    log("[b4] npu.current_device + synchronize (empty)")
+    log("[b4a] torch.npu.current_device()  (read only)")
+    try:
+        cur = torch.npu.current_device()
+        log(f"[b4a] ok current_device={cur}")
+    except Exception as e:
+        log(f"[b4a] FAIL {e!r}")
+
+    log("[b4b] torch.npu.set_device(0)")
     torch.npu.set_device(0)
+    log("[b4b] ok")
+
+    log("[b4c] torch.npu.synchronize()  <<< empty sync; if Abort here = runtime/driver")
     torch.npu.synchronize()
-    log("[b4] ok")
+    log("[b4c] ok")
 
     log("[b5] empty((1,), device=npu) + sync")
     t = torch.empty((1,), device="npu:0")
