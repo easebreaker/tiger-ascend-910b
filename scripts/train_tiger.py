@@ -37,6 +37,7 @@ from tiger_ascend.utils.device import (  # noqa: E402
     move_module_to_device_safe,
     resolve_device,
     synchronize,
+    warmup_npu,
 )
 from tiger_ascend.utils.metrics import (  # noqa: E402
     PAPER_BEAUTY_METRICS,
@@ -314,7 +315,10 @@ def train_loop(args):
         )
     tok, model = build_model(train_ds, args)
     if info.kind == "npu":
-        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
+        warmup_npu(0)
+        model = move_module_to_device_safe(
+            model, info.device, log=True, sync_each=True, progress_every=10, strategy="copy_"
+        )
     else:
         model.to(info.device)
 
@@ -488,7 +492,10 @@ def eval_loop(args):
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
     if info.kind == "npu":
-        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
+        warmup_npu(0)
+        model = move_module_to_device_safe(
+            model, info.device, log=False, sync_each=True, strategy="copy_"
+        )
     else:
         model.to(info.device)
     model.eval()

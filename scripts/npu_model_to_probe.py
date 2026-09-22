@@ -86,7 +86,9 @@ def main() -> None:
         f"{m3.shared is m3.encoder.embed_tokens} "
         f"shared is decoder.embed? {m3.shared is m3.decoder.embed_tokens}"
     )
-    move_module_to_device_safe(m3, "npu:0", log=True, sync_each=True)
+    move_module_to_device_safe(
+        m3, "npu:0", log=True, sync_each=True, progress_every=10, strategy="copy_"
+    )
     log("[m3] safe move ok — tiny forward")
     ids = torch.randint(2, 100, (2, 16), device="npu:0")
     lab = torch.randint(2, 100, (2, 4), device="npu:0")

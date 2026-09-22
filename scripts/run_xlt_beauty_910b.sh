@@ -23,8 +23,28 @@ elif [[ -f /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env
   source /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env.sh
 fi
 
+# 修法2: set_env 常把 toolkit 库放到 driver 前面，导致 npu-smi / 大块 H2D Abort。
+# 必须把 driver lib64 重新插到 LD_LIBRARY_PATH 最前。
+_ascend_prepend_driver_libs() {
+  local d
+  for d in \
+    /usr/local/Ascend/driver/lib64/driver \
+    /usr/local/Ascend/driver/lib64/common \
+    /usr/local/Ascend/driver/lib64; do
+    if [[ -d "$d" ]]; then
+      case ":${LD_LIBRARY_PATH:-}:" in
+        *":$d:"*) ;;
+        *) export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+      esac
+    fi
+  done
+}
+_ascend_prepend_driver_libs
+echo "[xlt-910b] LD_LIBRARY_PATH head=$(echo "${LD_LIBRARY_PATH:-}" | cut -d: -f1-3)"
+
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-1}"
 
 OUT="${OUT_DIR:-artifacts/ckpt_beauty_xlt}"
 DATA="${DATA_DIR:-data/amazon_beauty}"

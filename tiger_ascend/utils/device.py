@@ -77,6 +77,28 @@ def prepare_npu_runtime(device_index: int = 0) -> None:
     torch.npu.synchronize()
 
 
+def warmup_npu(device_index: int = 0) -> None:
+    """Match npu_model_to_probe m0/m1 before large T5 H2D.
+
+    Some torch_npu builds Abort on the first multi-megabyte transfer if the
+    runtime never allocated a small tensor / Linear first.
+    """
+    prepare_npu_runtime(device_index)
+    dev = torch.device(f"npu:{int(device_index)}")
+    x = torch.randn(8, 32, device=dev)
+    y = x @ x.T
+    torch.npu.synchronize()
+    lin = torch.nn.Linear(32, 32)
+    # Single small Module.to is OK (no tied Embedding graph).
+    lin.to(dev)
+    torch.npu.synchronize()
+    _ = lin(x)
+    torch.npu.synchronize()
+    del x, y, lin
+    if hasattr(torch.npu, "empty_cache"):
+        torch.npu.empty_cache()
+
+
 def _device_sync(device: torch.device) -> Optional[Callable[[], None]]:
     if device.type == "npu":
         return torch.npu.synchronize
@@ -91,6 +113,8 @@ def move_module_to_device_safe(
     *,
     log: bool = False,
     sync_each: bool = True,
+    progress_every: int = 1,
+    strategy: str = "copy_",
 ) -> torch.nn.Module:
     """Move params/buffers once each (by object id).
 
@@ -99,58 +123,78 @@ def move_module_to_device_safe(
     ``Module.to(npu)`` therefore applies H2D twice on one module; some
     torch_npu builds Abort there even when tiny Linear / basic ops work.
 
-    This helper walks unique Parameter/buffer storages only.
+    strategy:
+      - ``copy_``: empty_like on device then copy_ (often stabler on Ascend)
+      - ``to``: ``param.data = param.data.to(device)``
     """
     device = torch.device(device)
     sync = _device_sync(device)
     log_fn = print if log else (lambda *_a, **_k: None)
+    if strategy not in {"copy_", "to"}:
+        raise ValueError(f"unknown strategy={strategy}")
 
     if device.type == "npu":
         idx = device.index if device.index is not None else 0
         prepare_npu_runtime(idx)
 
-    seen_param: set[int] = set()
+    def _h2d(src: torch.Tensor) -> torch.Tensor:
+        if strategy == "copy_":
+            dst = torch.empty(src.shape, dtype=src.dtype, device=device)
+            dst.copy_(src, non_blocking=False)
+            return dst
+        return src.to(device, non_blocking=False)
+
+    unique_params = list(module.named_parameters(remove_duplicate=True))
+    unique_bufs = [
+        (n, b)
+        for n, b in module.named_buffers(remove_duplicate=True)
+        if torch.is_tensor(b)
+    ]
+    log_fn(
+        f"[npu-move] start strategy={strategy} params={len(unique_params)} "
+        f"buffers={len(unique_bufs)} device={device}",
+        flush=True,
+    )
+
     n_moved = 0
-    for name, param in module.named_parameters(remove_duplicate=False):
-        pid = id(param)
-        if pid in seen_param:
-            continue
-        seen_param.add(pid)
+    for name, param in unique_params:
         if param.device == device:
             continue
-        log_fn(f"[npu-move] param {name} shape={tuple(param.shape)} dtype={param.dtype}", flush=True)
-        with torch.no_grad():
-            param.data = param.data.to(device, non_blocking=False).contiguous()
         n_moved += 1
+        if log and (progress_every <= 1 or n_moved % progress_every == 1 or n_moved <= 3):
+            log_fn(
+                f"[npu-move] ({n_moved}/{len(unique_params)}) param {name} "
+                f"shape={tuple(param.shape)}",
+                flush=True,
+            )
+        with torch.no_grad():
+            param.data = _h2d(param.data)
         if sync_each and sync is not None:
             sync()
 
-    seen_buf: set[int] = set()
-    for name, buf in module.named_buffers(remove_duplicate=False):
-        if not torch.is_tensor(buf):
-            continue
-        bid = id(buf)
-        if bid in seen_buf:
-            continue
-        seen_buf.add(bid)
+    n_buf = 0
+    for name, buf in unique_bufs:
         if buf.device == device:
             continue
-        log_fn(f"[npu-move] buffer {name} shape={tuple(buf.shape)}", flush=True)
-        # Buffers live in module._buffers; replace via named path on parent.
+        n_buf += 1
+        if log:
+            log_fn(f"[npu-move] buffer {name} shape={tuple(buf.shape)}", flush=True)
         parts = name.rsplit(".", 1)
         if len(parts) == 1:
             parent, bname = module, parts[0]
         else:
             parent = module.get_submodule(parts[0])
             bname = parts[1]
-        parent._buffers[bname] = buf.to(device, non_blocking=False).contiguous()
-        n_moved += 1
+        parent._buffers[bname] = _h2d(buf)
         if sync_each and sync is not None:
             sync()
 
     if sync is not None:
         sync()
-    log_fn(f"[npu-move] done moved={n_moved} device={device}", flush=True)
+    log_fn(
+        f"[npu-move] done moved_params={n_moved} moved_buffers={n_buf} device={device}",
+        flush=True,
+    )
     return module
 
 

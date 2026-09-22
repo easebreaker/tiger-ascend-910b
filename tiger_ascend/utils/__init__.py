@@ -7,6 +7,7 @@ from .device import (
     prepare_npu_runtime,
     resolve_device,
     synchronize,
+    warmup_npu,
 )
 from .metrics import PAPER_BEAUTY_METRICS, format_vs_paper, ndcg_at_k, summarize_ranking
 
@@ -23,4 +24,5 @@ __all__ = [
     "resolve_device",
     "summarize_ranking",
     "synchronize",
+    "warmup_npu",
 ]

@@ -56,7 +56,9 @@ def main() -> None:
     from tiger_ascend.utils.device import move_module_to_device_safe, prepare_npu_runtime
 
     prepare_npu_runtime(0)
-    move_module_to_device_safe(model, "npu:0", log=True, sync_each=True)
+    move_module_to_device_safe(
+        model, "npu:0", log=True, sync_each=True, progress_every=10, strategy="copy_"
+    )
     log("[probe 5] ok")
 
     log("[probe 6] forward+backward batch=2 seq=80")

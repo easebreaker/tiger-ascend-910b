@@ -37,9 +37,9 @@ from tiger_ascend.utils.device import (  # noqa: E402
     dataloader_kwargs,
     move_batch_to_device,
     move_module_to_device_safe,
-    prepare_npu_runtime,
     resolve_device,
     synchronize,
+    warmup_npu,
 )
 from tiger_ascend.utils.metrics import PAPER_BEAUTY_METRICS, format_vs_paper  # noqa: E402
 
@@ -280,6 +280,28 @@ def train_loop(args):
     info = resolve_device(args.device)
     print(f"[device] kind={info.kind} device={info.device} sha={_git_sha()}", flush=True)
     set_seed(args.seed)
+
+    # Ascend: warmup + H2D BEFORE loading JSON (matches passing probe order).
+    print("[step] build model", flush=True)
+    model = build_model(args, info.kind)
+    if info.kind == "npu":
+        print("[step] npu warmup (tiny matmul + Linear)", flush=True)
+        warmup_npu(0)
+        print("[step] warmup ok", flush=True)
+        print(f"[step] move model -> {info.device} (safe/dedup copy_)", flush=True)
+        model = move_module_to_device_safe(
+            model,
+            info.device,
+            log=True,
+            sync_each=True,
+            progress_every=10,
+            strategy="copy_",
+        )
+    else:
+        print(f"[step] move model -> {info.device}", flush=True)
+        model.to(info.device)
+    print("[step] model on device ok", flush=True)
+
     print("[step] load json", flush=True)
     inters = load_json(inter_path(args.data_dir))
     indices = load_json(indice_path(args.data_dir))
@@ -289,20 +311,6 @@ def train_loop(args):
     test_ds = XltSeqDataset(inters, indices, args.max_his_len, mode="test")
     print(f"[data] train={len(train_ds)} valid={len(valid_ds)} test={len(test_ds)}", flush=True)
 
-    print("[step] build model", flush=True)
-    model = build_model(args, info.kind)
-    print(f"[step] move model -> {info.device} (safe/dedup for NPU)", flush=True)
-    if info.kind == "npu":
-        prepare_npu_runtime(0)
-        print("[step] prepare_npu_runtime ok", flush=True)
-        # Probe already validated param-wise H2D; skip per-tensor sync/log (slow).
-        # Do NOT use model.to(npu): T5 shared Embedding is double-applied and Aborts.
-        n_unique = sum(1 for _ in model.parameters())
-        print(f"[step] H2D unique_params≈{n_unique} (no per-tensor sync)", flush=True)
-        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
-    else:
-        model.to(info.device)
-    print("[step] model on device ok", flush=True)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})
     grad_accum = max(1, args.grad_accum)
     if info.kind == "npu" and args.batch_size >= 64:
@@ -433,7 +441,10 @@ def eval_loop(args):
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
     if info.kind == "npu":
-        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
+        warmup_npu(0)
+        model = move_module_to_device_safe(
+            model, info.device, log=False, sync_each=True, strategy="copy_"
+        )
     else:
         model.to(info.device)
     use_amp = bool(args.amp and not args.no_amp and info.kind in {"cuda", "npu"})

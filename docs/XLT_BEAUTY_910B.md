@@ -40,15 +40,16 @@ bash scripts/run_xlt_beauty_910b.sh --probe
 export ASCEND_LAUNCH_BLOCKING=1
 python -u scripts/npu_basic_probe.py
 
-# 1c) basic 通过但 smoke 死在 model.to(npu)：
-#     原因常是 T5 shared Embedding 被 encoder/decoder 各 .to() 一次 → Ascend Abort
-#     训练脚本已改为 param-wise 去重搬运；探针顺序：m3=safe → m4=bulk
+# 1c) basic 通过但 smoke 死在 model.to / safe move：
+#     - launcher 会自动做 修法2（driver lib64 前置）
+#     - 训练改为：warmup → copy_ 去重 H2D → 再读数据（与探针顺序一致）
 python -u scripts/npu_model_to_probe.py
-# 期望：[m3] safe move ok；若 [m4] Abort 可忽略（smoke 已不走 bulk .to）
-# probe 全过后，smoke 在 move 步应很快出现 [step] model on device ok
+# 期望：[m3] safe move ok；若 [m4] Abort 可忽略
+# smoke 日志应出现 [step] warmup ok 以及 [npu-move] (N/M) param ...
 
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke
+# 若仍中断：把最后一条 [npu-move] / [step] 行贴回
 
 # 3) 正式全量
 bash scripts/run_xlt_beauty_910b.sh
