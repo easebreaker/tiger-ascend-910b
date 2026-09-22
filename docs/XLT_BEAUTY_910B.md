@@ -30,9 +30,21 @@
 ## 910B
 
 ```bash
+# 冒烟（推荐先跑；workers=0，小 batch）
+bash scripts/run_xlt_beauty_910b.sh --smoke
+
+# 正式
 bash scripts/run_xlt_beauty_910b.sh
-# OOM:  ... --batch_size 32 --grad_accum 8
-# 冒烟: ... --max_train_steps 20 --skip_valid --epochs 1
+
+# OOM
+BATCH_SIZE=32 GRAD_ACCUM=8 bash scripts/run_xlt_beauty_910b.sh
+```
+
+若出现 `Aborted`（无 Python traceback）：几乎总是 **NPU + DataLoader `num_workers>0`**。本脚本默认 `NUM_WORKERS=0`；确认 CANN/`set_env.sh` 已 source。调试可加：
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+bash scripts/run_xlt_beauty_910b.sh --smoke
 ```
 
 结果：`artifacts/ckpt_beauty_xlt/eval_metrics.json`

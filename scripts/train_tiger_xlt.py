@@ -58,7 +58,12 @@ def parse_args():
     p.add_argument("--topk", type=str, default="5,10,20")
     p.add_argument("--early_stop", type=int, default=10)
     p.add_argument("--seed", type=int, default=2025)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader workers; keep 0 on Ascend NPU (workers>0 often Aborted)",
+    )
     p.add_argument("--amp", action="store_true", help="optional; upstream is FP32")
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--log_every", type=int, default=50)
