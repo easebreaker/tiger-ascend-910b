@@ -27,13 +27,16 @@
 
 ## 论文配方测算（推荐）
 
-完整说明见 [`docs/PAPER_BEAUTY_910B.md`](../../docs/PAPER_BEAUTY_910B.md)。
+**选定参考：XiaoLongtaoo/TIGER**
 
 ```bash
-bash scripts/run_paper_beauty_910b.sh
+bash scripts/run_xlt_beauty_910b.sh
 ```
 
-对照论文 Beauty：Recall@5=0.0454，NDCG@5=0.0321，Recall@10=0.0648，NDCG@10=0.0384。
+说明：[`docs/XLT_BEAUTY_910B.md`](../../docs/XLT_BEAUTY_910B.md)  
+上游 Beauty：R@5=0.0392，N@5=0.0257，R@10=0.0594，N@10=0.0321。
+
+按论文文字的另一配方：[`docs/PAPER_BEAUTY_910B.md`](../../docs/PAPER_BEAUTY_910B.md)。
 
 ## 子集冒烟
 

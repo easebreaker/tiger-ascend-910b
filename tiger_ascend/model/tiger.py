@@ -185,3 +185,25 @@ def build_paper_t5_config(vocab_size: int, dropout_rate: float = 0.1) -> T5Confi
         d_kv=64,
         dropout_rate=dropout_rate,
     )
+
+
+def build_xlt_t5_config(vocab_size: int = 1025, dropout_rate: float = 0.1) -> T5Config:
+    """XiaoLongtaoo/TIGER ``model/main.py`` defaults (d_model=128)."""
+    return T5Config(
+        vocab_size=vocab_size,
+        d_model=128,
+        d_ff=1024,
+        d_kv=64,
+        num_layers=4,
+        num_decoder_layers=4,
+        num_heads=6,
+        dropout_rate=dropout_rate,
+        layer_norm_epsilon=1e-6,
+        initializer_factor=1.0,
+        feed_forward_proj="relu",
+        is_encoder_decoder=True,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=0,
+        decoder_start_token_id=0,
+    )

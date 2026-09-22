@@ -15,6 +15,7 @@ scripts/convert_tiger_amazon_index.py
 docs/ASCEND_910B_ENV_AND_OPS.md
 docs/DEPLOY_STEP_BY_STEP_910B.md
 docs/PAPER_BEAUTY_910B.md
+docs/XLT_BEAUTY_910B.md
 docs/FIDELITY_AND_910B_CLAIMS.md
 ```
 
@@ -39,23 +40,16 @@ python scripts/train_tiger.py --mode eval --device npu \
 
 ## 训练效率说明
 
-本仓默认是 **910B 跑通骨架**（`--recipe smoke`）。要按论文配方在 Beauty 上测算，用：
+**推荐测算（对齐 XiaoLongtaoo/TIGER，~252★）：**
 
 ```bash
-bash scripts/run_paper_beauty_910b.sh
-# 详见 docs/PAPER_BEAUTY_910B.md
+bash scripts/run_xlt_beauty_910b.sh
+# 详见 docs/XLT_BEAUTY_910B.md
 ```
 
-论文本身没有单独的「训练加速算法」；本仓 paper recipe 还原的是：**200k step、eff_batch=256、inv-sqrt LR、user hash、~13M T5、Recall/NDCG@5/10**。工程侧另加 AMP / DataLoader workers / grad accum。
+上游 Beauty：R@5=0.0392，N@5=0.0257，R@10=0.0594，N@10=0.0321。
 
-| 项 | smoke 默认 | `--recipe paper` |
-|---|---|---|
-| 有效 batch | 8 | 256（64×4） |
-| 模型 | 2 层 d=128 | 4 层 d=384（~14M） |
-| 步数 | 少数 epoch | 200k |
-| AMP / workers | 关 / 0 | 开 / 4 |
-
-后续社区加速（rk-means、SID-MLP）未接入。
+另有按论文文字的 `--recipe paper`（`docs/PAPER_BEAUTY_910B.md`）；保真度见 `docs/FIDELITY_AND_910B_CLAIMS.md`。
 
 ## 指标怎么读（loss ↓ 但 Hit@K≈0）
 

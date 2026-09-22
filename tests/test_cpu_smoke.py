@@ -158,3 +158,35 @@ def test_ndcg_and_paper_reference():
     assert abs(metrics["recall@1"] - 0.5) < 1e-9
     assert abs(metrics["recall@2"] - 1.0) < 1e-9
     assert "recall@5" in PAPER_BEAUTY_METRICS
+
+
+def test_xlt_codec_and_dataset():
+    from tiger_ascend.data.xlt import XltSeqDataset, parse_level_codes
+
+    codes = parse_level_codes(["<a_1>", "<b_2>", "<c_3>", "<d_4>"])
+    assert codes == [1 + 1, 2 + 256 + 1, 3 + 512 + 1, 4 + 768 + 1]
+    inter = {"0": [0, 1, 2, 3, 4], "1": [1, 2, 3, 4, 5, 6]}
+    indices = {
+        str(i): [f"<a_{i % 8}>", f"<b_{(i + 1) % 8}>", f"<c_{(i + 2) % 8}>", f"<d_{(i + 3) % 8}>"]
+        for i in range(8)
+    }
+    ds = XltSeqDataset(inter, indices, max_his_len=20, mode="train", codebook_size=256)
+    assert len(ds) > 0
+    row = ds[0]
+    assert len(row["history"]) == 80
+    assert len(row["target"]) == 4
+    batch = ds.get_collate_fn()([ds[0], ds[1]])
+    assert batch["input_ids"].shape[1] == 80
+    assert batch["labels"].shape[1] == 4
+
+
+def test_xlt_config_size():
+    from transformers import T5ForConditionalGeneration
+
+    from tiger_ascend.model.tiger import build_xlt_t5_config
+
+    cfg = build_xlt_t5_config(1025)
+    model = T5ForConditionalGeneration(cfg)
+    n = sum(p.numel() for p in model.parameters())
+    assert cfg.d_model == 128 and cfg.d_ff == 1024 and cfg.eos_token_id == 0
+    assert 3e6 < n < 8e6

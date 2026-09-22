@@ -21,5 +21,11 @@ This repository adapts code and ideas from:
    Original reviews: https://jmcauley.ucsd.edu/data/amazon/
    Paper: Rajput et al., Recommender Systems with Generative Retrieval (NeurIPS 2023)
 
+4) XiaoLongtaoo/TIGER (selected reference for 910B measurement)
+   https://github.com/XiaoLongtaoo/TIGER
+   License: MIT
+   Referenced for numeric SID encoding, T5 hyperparams (d_model=128),
+   Adam 1e-4 / batch 256 / beam 30 / early-stop, and Beauty README numbers.
+
 Paper reference:
   Rajput et al., Recommender Systems with Generative Retrieval (TIGER).

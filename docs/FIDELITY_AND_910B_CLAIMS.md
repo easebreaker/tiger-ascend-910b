@@ -1,5 +1,15 @@
 # TIGER 复刻保真度说明（能否代表 910B「真实性能」）
 
+## 推荐对照：XiaoLongtaoo/TIGER
+
+选定参考实现（~252★）：https://github.com/XiaoLongtaoo/TIGER
+
+```bash
+bash scripts/run_xlt_beauty_910b.sh
+```
+
+详见 `docs/XLT_BEAUTY_910B.md`。Beauty 目标 R@5≈0.0392（论文 0.0454）。
+
 ## 直接结论
 
 | 问题 | 答案 |
