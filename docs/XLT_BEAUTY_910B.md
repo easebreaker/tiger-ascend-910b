@@ -45,6 +45,7 @@ python -u scripts/npu_basic_probe.py
 #     训练脚本已改为 param-wise 去重搬运；探针顺序：m3=safe → m4=bulk
 python -u scripts/npu_model_to_probe.py
 # 期望：[m3] safe move ok；若 [m4] Abort 可忽略（smoke 已不走 bulk .to）
+# probe 全过后，smoke 在 move 步应很快出现 [step] model on device ok
 
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke

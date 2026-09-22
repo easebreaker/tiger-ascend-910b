@@ -314,7 +314,7 @@ def train_loop(args):
         )
     tok, model = build_model(train_ds, args)
     if info.kind == "npu":
-        model = move_module_to_device_safe(model, info.device, log=True, sync_each=True)
+        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
     else:
         model.to(info.device)
 

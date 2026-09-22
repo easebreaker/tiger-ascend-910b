@@ -295,10 +295,11 @@ def train_loop(args):
     if info.kind == "npu":
         prepare_npu_runtime(0)
         print("[step] prepare_npu_runtime ok", flush=True)
-        # Do NOT use model.to(npu) / model.npu(): T5 shares `shared` under
-        # encoder/decoder embed_tokens; recursive .to() double-applies H2D and
-        # Aborts on some torch_npu builds even after basic probes pass.
-        model = move_module_to_device_safe(model, info.device, log=True, sync_each=True)
+        # Probe already validated param-wise H2D; skip per-tensor sync/log (slow).
+        # Do NOT use model.to(npu): T5 shared Embedding is double-applied and Aborts.
+        n_unique = sum(1 for _ in model.parameters())
+        print(f"[step] H2D unique_params≈{n_unique} (no per-tensor sync)", flush=True)
+        model = move_module_to_device_safe(model, info.device, log=False, sync_each=False)
     else:
         model.to(info.device)
     print("[step] model on device ok", flush=True)
