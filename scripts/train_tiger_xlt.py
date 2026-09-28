@@ -281,13 +281,15 @@ def train_loop(args):
     print(f"[device] kind={info.kind} device={info.device} sha={_git_sha()}", flush=True)
     set_seed(args.seed)
 
-    # Ascend: warmup + H2D BEFORE loading JSON (matches passing probe order).
+    # Ascend: warmup FIRST (tensor-only), then build+H2D (matches basic probe order).
+    if info.kind == "npu":
+        print("[step] npu warmup (tensor alloc + matmul, no Module.to)", flush=True)
+        warmup_npu(0, log=True)
+        print("[step] warmup ok", flush=True)
+
     print("[step] build model", flush=True)
     model = build_model(args, info.kind)
     if info.kind == "npu":
-        print("[step] npu warmup (tiny matmul + Linear)", flush=True)
-        warmup_npu(0)
-        print("[step] warmup ok", flush=True)
         print(f"[step] move model -> {info.device} (safe/dedup copy_)", flush=True)
         model = move_module_to_device_safe(
             model,

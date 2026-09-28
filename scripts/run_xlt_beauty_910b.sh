@@ -46,6 +46,12 @@ export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-1}"
 
+echo "[xlt-910b] ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
+if command -v npu-smi >/dev/null 2>&1; then
+  echo "[xlt-910b] npu-smi (check free HBM / whether vllmworker holds the card):"
+  npu-smi info 2>/dev/null | head -n 40 || true
+fi
+
 OUT="${OUT_DIR:-artifacts/ckpt_beauty_xlt}"
 DATA="${DATA_DIR:-data/amazon_beauty}"
 NUM_WORKERS="${NUM_WORKERS:-0}"

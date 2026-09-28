@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -77,27 +78,70 @@ def prepare_npu_runtime(device_index: int = 0) -> None:
     torch.npu.synchronize()
 
 
-def warmup_npu(device_index: int = 0) -> None:
-    """Match npu_model_to_probe m0/m1 before large T5 H2D.
+def npu_preflight(device_index: int = 0, log: bool = True) -> dict:
+    """Print visible-device / memory hints before warmup (vLLM often fills card 0)."""
+    info: dict = {
+        "visible": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+        "count": int(torch.npu.device_count()) if hasattr(torch, "npu") else 0,
+        "free_bytes": None,
+        "total_bytes": None,
+    }
+    log_fn = print if log else (lambda *_a, **_k: None)
+    log_fn(
+        f"[npu-preflight] ASCEND_RT_VISIBLE_DEVICES={info['visible']!r} "
+        f"torch.npu.device_count={info['count']} logical_index={device_index}",
+        flush=True,
+    )
+    try:
+        prepare_npu_runtime(device_index)
+        if hasattr(torch.npu, "mem_get_info"):
+            free_b, total_b = torch.npu.mem_get_info(device_index)
+            info["free_bytes"], info["total_bytes"] = int(free_b), int(total_b)
+            log_fn(
+                f"[npu-preflight] mem free={free_b / 1e9:.2f}GB "
+                f"total={total_b / 1e9:.2f}GB",
+                flush=True,
+            )
+            if total_b > 0 and free_b / total_b < 0.15:
+                log_fn(
+                    "[npu-preflight] WARNING: <15% free — likely another job "
+                    "(e.g. vllmworker-tp). Pick a free card: "
+                    "npu-smi info && export ASCEND_RT_VISIBLE_DEVICES=<id>",
+                    flush=True,
+                )
+    except Exception as e:
+        log_fn(f"[npu-preflight] mem_get_info failed: {e!r}", flush=True)
+    return info
 
-    Some torch_npu builds Abort on the first multi-megabyte transfer if the
-    runtime never allocated a small tensor / Linear first.
+
+def warmup_npu(device_index: int = 0, *, log: bool = True) -> None:
+    """Tiny tensor ops only (no Module.to) before large T5 H2D.
+
+    Avoid ``nn.Linear(...).to(npu)`` here: some builds Abort on any Module.to
+    while plain tensor alloc/matmul still work (and match npu_basic_probe).
     """
+    log_fn = print if log else (lambda *_a, **_k: None)
+    npu_preflight(device_index, log=log)
+    log_fn("[warmup] w1 set_device+sync", flush=True)
     prepare_npu_runtime(device_index)
-    dev = torch.device(f"npu:{int(device_index)}")
-    x = torch.randn(8, 32, device=dev)
+    log_fn("[warmup] w2 empty tensor on npu", flush=True)
+    t = torch.empty(4, 4, device=f"npu:{int(device_index)}")
+    torch.npu.synchronize()
+    log_fn("[warmup] w3 randn + matmul", flush=True)
+    x = torch.randn(8, 32, device=f"npu:{int(device_index)}")
     y = x @ x.T
     torch.npu.synchronize()
-    lin = torch.nn.Linear(32, 32)
-    # Single small Module.to is OK (no tied Embedding graph).
-    lin.to(dev)
+    log_fn(f"[warmup] w3 ok y={tuple(y.shape)}", flush=True)
+    log_fn("[warmup] w4 addmm (Linear math without Module.to)", flush=True)
+    w = torch.randn(32, 32, device=f"npu:{int(device_index)}")
+    b = torch.randn(32, device=f"npu:{int(device_index)}")
+    z = torch.addmm(b, x, w.T)
     torch.npu.synchronize()
-    _ = lin(x)
-    torch.npu.synchronize()
-    del x, y, lin
+    log_fn(f"[warmup] w4 ok z={tuple(z.shape)}", flush=True)
+    del t, x, y, w, b, z
     if hasattr(torch.npu, "empty_cache"):
         torch.npu.empty_cache()
-
+    log_fn("[warmup] done", flush=True)
 
 def _device_sync(device: torch.device) -> Optional[Callable[[], None]]:
     if device.type == "npu":
