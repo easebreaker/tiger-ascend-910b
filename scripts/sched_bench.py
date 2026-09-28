@@ -29,33 +29,14 @@ import sys
 import time
 from typing import Optional
 
-import torch
-from torch.utils.data import DataLoader, DistributedSampler
-
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from tiger_ascend.bench.dist_utils import (  # noqa: E402
-    barrier,
-    cleanup_dist,
-    init_dist,
-    is_main,
-)
-from tiger_ascend.bench.metrics import BenchReport, MetricsCollector  # noqa: E402
 from tiger_ascend.bench.strategies import (  # noqa: E402
     BOUNDARY_UNSUPPORTED,
     STRATEGIES,
     SUPPORTED_RUNNABLE,
-)
-from tiger_ascend.data.dataset import load_json  # noqa: E402
-from tiger_ascend.data.xlt import XLT_VOCAB_SIZE, XltSeqDataset  # noqa: E402
-from tiger_ascend.model.tiger import build_xlt_t5_config  # noqa: E402
-from tiger_ascend.utils.device import (  # noqa: E402
-    move_batch_to_device,
-    move_module_to_device_safe,
-    prepare_npu_runtime,
-    warmup_npu,
 )
 
 
@@ -159,6 +140,53 @@ def _maybe_ddp(model, dist, strategy: str):
 
 
 def run_training(args) -> Optional[BenchReport]:
+    import torch
+    from torch.utils.data import DataLoader, DistributedSampler
+
+    from tiger_ascend.bench.dist_utils import barrier, cleanup_dist, init_dist, is_main
+    from tiger_ascend.bench.metrics import MetricsCollector
+    from tiger_ascend.data.dataset import load_json
+    from tiger_ascend.data.xlt import XLT_VOCAB_SIZE, XltSeqDataset
+    from tiger_ascend.model.tiger import build_xlt_t5_config
+    from tiger_ascend.utils.device import (
+        move_batch_to_device,
+        move_module_to_device_safe,
+        prepare_npu_runtime,
+        warmup_npu,
+    )
+
+    # re-bind helpers that close over imports
+    def _build_model(layout: str, device: torch.device):
+        from transformers import T5ForConditionalGeneration
+
+        cfg = build_xlt_t5_config(XLT_VOCAB_SIZE, dropout_rate=0.1, layout=layout, use_cache=False)
+        try:
+            model = T5ForConditionalGeneration(cfg, attn_implementation="eager")
+        except TypeError:
+            model = T5ForConditionalGeneration(cfg)
+        if hasattr(model.config, "_attn_implementation"):
+            model.config._attn_implementation = "eager"
+        if device.type == "npu":
+            prepare_npu_runtime(device.index or 0, log=False)
+            _ = torch.zeros(1, device=device)
+            if hasattr(torch, "npu"):
+                torch.npu.synchronize()
+            model = move_module_to_device_safe(
+                model, device, log=False, sync_each=False, strategy="copy_"
+            )
+        else:
+            model.to(device)
+        return model
+
+    def _maybe_ddp(model, dist, strategy: str):
+        if strategy != "dp" or not dist.enabled or dist.world_size <= 1:
+            return model
+        return torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=None,
+            find_unused_parameters=False,
+        )
+
     dist = init_dist(args.device)
     if args.device == "npu" and dist.rank == 0:
         # optional host-side warmup on logical 0 when single-proc
