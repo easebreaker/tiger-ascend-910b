@@ -443,7 +443,7 @@ def eval_loop(args):
     state = torch.load(os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu")
     model.load_state_dict(state)
     if info.kind == "npu":
-        warmup_npu(0)
+        warmup_npu(0, log=False)
         model = move_module_to_device_safe(
             model, info.device, log=False, sync_each=True, strategy="copy_"
         )

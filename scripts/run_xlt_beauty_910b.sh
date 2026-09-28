@@ -85,6 +85,11 @@ while [[ $# -gt 0 ]]; do
       python -u scripts/npu_model_to_probe.py
       exit 0
       ;;
+    --probe-device)
+      echo "[xlt-910b] running set_device probe (use when stuck after npu-preflight)"
+      python -u scripts/npu_set_device_probe.py
+      exit 0
+      ;;
     --skip-eval)
       SKIP_EVAL=1
       shift

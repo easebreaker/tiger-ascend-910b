@@ -65,21 +65,31 @@ def amp_device_type(info: DeviceInfo) -> str:
     return info.kind if info.kind in {"cuda", "npu"} else "cpu"
 
 
-def prepare_npu_runtime(device_index: int = 0) -> None:
+def prepare_npu_runtime(device_index: int = 0, *, log: bool = False) -> None:
     """Set device + disable JIT compile paths that often Abort on Ascend .to()."""
+    log_fn = print if log else (lambda *_a, **_k: None)
     if not (hasattr(torch, "npu") and torch.npu.is_available()):
         raise RuntimeError("NPU unavailable")
+    log_fn("[npu-prep] p1 set_compile_mode(jit_compile=False)", flush=True)
     if hasattr(torch.npu, "set_compile_mode"):
         try:
             torch.npu.set_compile_mode(jit_compile=False)
-        except Exception:
-            pass
+        except Exception as e:
+            log_fn(f"[npu-prep] set_compile_mode skipped: {e!r}", flush=True)
+    log_fn(f"[npu-prep] p2 set_device({device_index})", flush=True)
     torch.npu.set_device(int(device_index))
+    log_fn("[npu-prep] p3 synchronize()", flush=True)
     torch.npu.synchronize()
+    log_fn("[npu-prep] ok", flush=True)
 
 
 def npu_preflight(device_index: int = 0, log: bool = True) -> dict:
-    """Print visible-device / memory hints before warmup (vLLM often fills card 0)."""
+    """Print visible-device / memory hints before warmup (vLLM often fills card 0).
+
+    With ``ASCEND_RT_VISIBLE_DEVICES=7``, torch only sees 1 device and you must
+    use logical ``npu:0`` (not npu:7). Dying right after the first preflight
+    line usually means ``set_device`` / ``synchronize`` Aborted on that card.
+    """
     info: dict = {
         "visible": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
         "count": int(torch.npu.device_count()) if hasattr(torch, "npu") else 0,
@@ -89,11 +99,16 @@ def npu_preflight(device_index: int = 0, log: bool = True) -> dict:
     log_fn = print if log else (lambda *_a, **_k: None)
     log_fn(
         f"[npu-preflight] ASCEND_RT_VISIBLE_DEVICES={info['visible']!r} "
-        f"torch.npu.device_count={info['count']} logical_index={device_index}",
+        f"torch.npu.device_count={info['count']} logical_index={device_index} "
+        f"(physical card filtered by env; always use npu:{device_index})",
         flush=True,
     )
+    if info["count"] < 1:
+        raise RuntimeError("torch.npu.device_count==0 after ASCEND_RT_VISIBLE_DEVICES filter")
+    # Do NOT wrap set_device in try/except: Ascend often SIGABRT, not Python error.
+    prepare_npu_runtime(device_index, log=log)
+    log_fn("[npu-preflight] p4 mem_get_info (optional)", flush=True)
     try:
-        prepare_npu_runtime(device_index)
         if hasattr(torch.npu, "mem_get_info"):
             free_b, total_b = torch.npu.mem_get_info(device_index)
             info["free_bytes"], info["total_bytes"] = int(free_b), int(total_b)
@@ -104,13 +119,14 @@ def npu_preflight(device_index: int = 0, log: bool = True) -> dict:
             )
             if total_b > 0 and free_b / total_b < 0.15:
                 log_fn(
-                    "[npu-preflight] WARNING: <15% free — likely another job "
-                    "(e.g. vllmworker-tp). Pick a free card: "
-                    "npu-smi info && export ASCEND_RT_VISIBLE_DEVICES=<id>",
+                    "[npu-preflight] WARNING: <15% free — card busy "
+                    "(vllmworker-tp?). npu-smi info && pick another id",
                     flush=True,
                 )
+        else:
+            log_fn("[npu-preflight] mem_get_info not available", flush=True)
     except Exception as e:
-        log_fn(f"[npu-preflight] mem_get_info failed: {e!r}", flush=True)
+        log_fn(f"[npu-preflight] mem_get_info failed (continue): {e!r}", flush=True)
     return info
 
 
@@ -122,8 +138,7 @@ def warmup_npu(device_index: int = 0, *, log: bool = True) -> None:
     """
     log_fn = print if log else (lambda *_a, **_k: None)
     npu_preflight(device_index, log=log)
-    log_fn("[warmup] w1 set_device+sync", flush=True)
-    prepare_npu_runtime(device_index)
+    # prepare already done in preflight; only allocate.
     log_fn("[warmup] w2 empty tensor on npu", flush=True)
     t = torch.empty(4, 4, device=f"npu:{int(device_index)}")
     torch.npu.synchronize()
