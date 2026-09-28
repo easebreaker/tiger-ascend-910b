@@ -38,7 +38,17 @@ python scripts/train_tiger.py --mode eval --device npu \
   --output_dir artifacts/ckpt_beauty_subset
 ```
 
-## 训练效率说明
+## 多芯调度实验台
+
+组内调度向实验（策略参数化 + P50/P90/P99 / 加速比 / 峰值显存 / 分段耗时）：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7   # 空闲卡
+bash scripts/run_sched_bench.sh
+# 详见 docs/SCHED_BENCH_910B.md
+```
+
+策略：`single` | `dp` | `overalloc`（可跑）+ `tp`/`pp`/`ep`/`sp`（边界结论 JSON）。
 
 **推荐测算（对齐 XiaoLongtaoo/TIGER，~252★）：**
 
