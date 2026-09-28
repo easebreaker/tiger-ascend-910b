@@ -105,41 +105,8 @@ def _resolve_batch(args, world_size: int) -> tuple[int, int, int]:
     return per, args.grad_accum, gb
 
 
-def _build_model(layout: str, device: torch.device):
-    from transformers import T5ForConditionalGeneration
 
-    cfg = build_xlt_t5_config(XLT_VOCAB_SIZE, dropout_rate=0.1, layout=layout, use_cache=False)
-    try:
-        model = T5ForConditionalGeneration(cfg, attn_implementation="eager")
-    except TypeError:
-        model = T5ForConditionalGeneration(cfg)
-    if hasattr(model.config, "_attn_implementation"):
-        model.config._attn_implementation = "eager"
-    if device.type == "npu":
-        prepare_npu_runtime(device.index or 0, log=False)
-        # Warmup only on this device index via explicit alloc
-        _ = torch.zeros(1, device=device)
-        if hasattr(torch, "npu"):
-            torch.npu.synchronize()
-        model = move_module_to_device_safe(
-            model, device, log=False, sync_each=False, strategy="copy_"
-        )
-    else:
-        model.to(device)
-    return model
-
-
-def _maybe_ddp(model, dist, strategy: str):
-    if strategy != "dp" or not dist.enabled or dist.world_size <= 1:
-        return model
-    return torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=None,  # device already set on params
-        find_unused_parameters=False,
-    )
-
-
-def run_training(args) -> Optional[BenchReport]:
+def run_training(args):
     import torch
     from torch.utils.data import DataLoader, DistributedSampler
 
