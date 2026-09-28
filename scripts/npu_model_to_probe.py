@@ -30,9 +30,12 @@ def main() -> None:
     from tiger_ascend.utils.device import move_module_to_device_safe, prepare_npu_runtime
 
     assert torch.npu.is_available()
-    log("[m0] prepare_npu_runtime")
-    prepare_npu_runtime(0)
-    log("[m0] ok")
+    log("[m0] prepare_npu_runtime (no set_device by default)")
+    prepare_npu_runtime(0, log=True)
+    log("[m0] ok — first alloc without set_device")
+    _ = torch.empty(2, 2, device="npu:0")
+    torch.npu.synchronize()
+    log("[m0] first alloc ok")
 
     log("[m1] tiny Linear.to(npu)")
     lin = torch.nn.Linear(32, 32)

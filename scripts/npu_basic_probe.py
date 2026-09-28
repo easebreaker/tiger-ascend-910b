@@ -48,13 +48,16 @@ def main() -> None:
     except Exception as e:
         log(f"[b4a] FAIL {e!r}")
 
-    log("[b4b] torch.npu.set_device(0)")
-    torch.npu.set_device(0)
-    log("[b4b] ok")
-
-    log("[b4c] torch.npu.synchronize()  <<< empty sync; if Abort here = runtime/driver")
-    torch.npu.synchronize()
-    log("[b4c] ok")
+    if os.environ.get("TIGER_NPU_SET_DEVICE", "0").strip() in {"1", "true", "True"}:
+        log("[b4b] torch.npu.set_device(0)  (TIGER_NPU_SET_DEVICE=1)")
+        torch.npu.set_device(0)
+        log("[b4b] ok")
+        log("[b4c] torch.npu.synchronize()")
+        torch.npu.synchronize()
+        log("[b4c] ok")
+    else:
+        log("[b4b] skip set_device (default; set TIGER_NPU_SET_DEVICE=1 to test it)")
+        log("[b4c] skip empty synchronize before first alloc")
 
     log("[b5] empty((1,), device=npu) + sync")
     t = torch.empty((1,), device="npu:0")

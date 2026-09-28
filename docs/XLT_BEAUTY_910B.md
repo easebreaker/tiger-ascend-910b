@@ -45,9 +45,10 @@ python -u scripts/npu_basic_probe.py
 #     - 训练改为：warmup → copy_ 去重 H2D → 再读数据（与探针顺序一致）
 python -u scripts/npu_model_to_probe.py
 # 期望：[m3] safe move ok；若 [m4] Abort 可忽略
-# smoke 若死在 warmup：先看 npu-smi，卡是否被 vllmworker-tp 占满；换空闲卡：
-#   export ASCEND_RT_VISIBLE_DEVICES=<空闲卡号>
-# 日志会打印 [warmup] w1/w2/w3/w4，看最后停在哪一步。
+# smoke 若死在 p2 set_device：已默认跳过 set_device，只用 device='npu:0' 分配。
+#   git pull && export ASCEND_RT_VISIBLE_DEVICES=7
+#   bash scripts/run_xlt_beauty_910b.sh --probe-device   # 应看到 skip set_device 后 s7/s8 ok
+#   bash scripts/run_xlt_beauty_910b.sh --smoke
 
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
 bash scripts/run_xlt_beauty_910b.sh --smoke
