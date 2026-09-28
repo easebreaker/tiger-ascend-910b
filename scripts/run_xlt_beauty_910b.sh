@@ -47,9 +47,10 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-1}"
 
 echo "[xlt-910b] ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
+echo "[xlt-910b] tip: only the visible physical id must be free; busy 1/2 ok if you use e.g. 7"
 if command -v npu-smi >/dev/null 2>&1; then
-  echo "[xlt-910b] npu-smi (check free HBM / whether vllmworker holds the card):"
-  npu-smi info 2>/dev/null | head -n 40 || true
+  echo "[xlt-910b] npu-smi (confirm YOUR visible card has no Process / free HBM):"
+  npu-smi info 2>/dev/null | head -n 60 || true
 fi
 
 OUT="${OUT_DIR:-artifacts/ckpt_beauty_xlt}"
