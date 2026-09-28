@@ -27,12 +27,27 @@ def main() -> None:
     log(f"[a0] ASCEND_LAUNCH_BLOCKING={os.environ.get('ASCEND_LAUNCH_BLOCKING')!r}")
     log(f"[a0] ASCEND_DEVICE_ID={os.environ.get('ASCEND_DEVICE_ID')!r}")
     ld = os.environ.get("LD_LIBRARY_PATH", "")
-    head = ":".join(ld.split(":")[:5]) if ld else ""
+    parts = [p for p in ld.split(":") if p]
+    head = ":".join(parts[:5])
     log(f"[a0] LD_LIBRARY_PATH head={head}")
-    if "driver/lib64" not in ld:
+    if not parts:
+        log("[a0] WARNING: LD_LIBRARY_PATH empty")
+    else:
+        first = parts[0]
+        if "/driver/" in first:
+            log(f"[a0] OK: driver first → {first}")
+        elif "/ascend-toolkit/" in first or "/cann/" in first:
+            log(
+                "[a0] BAD: toolkit/cann is first — run via bash scripts/* "
+                "which source scripts/ascend_env.sh (force driver ahead)"
+            )
+            log(f"[a0] first={first}")
+        else:
+            log(f"[a0] NOTE: first entry not driver/toolkit: {first}")
+    if not any("/driver/lib64" in p for p in parts):
         log(
-            "[a0] WARNING: LD_LIBRARY_PATH missing Ascend driver/lib64 — "
-            "re-apply 修法2 after set_env.sh"
+            "[a0] WARNING: no driver/lib64 in LD_LIBRARY_PATH — "
+            "use: source scripts/ascend_env.sh"
         )
 
     log("[a1] /dev/davinci* nodes visible to this process")

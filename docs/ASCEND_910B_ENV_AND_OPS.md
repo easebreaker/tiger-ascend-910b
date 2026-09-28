@@ -49,6 +49,8 @@ https://github.com/Ascend/pytorch
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export ASCEND_RT_VISIBLE_DEVICES=0
+# 修法2：driver lib64 必须在 toolkit 之前（本仓 launcher 已自动做）
+# source scripts/ascend_env.sh   # 或 bash scripts/run_xlt_beauty_910b.sh
 # 可选：减少碎片
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 ```

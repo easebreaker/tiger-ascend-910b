@@ -9,13 +9,8 @@ if [[ -f .venv/bin/activate ]]; then
   # shellcheck disable=SC1091
   source .venv/bin/activate
 fi
-if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
-  # shellcheck disable=SC1091
-  source /usr/local/Ascend/ascend-toolkit/set_env.sh
-elif [[ -f /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env.sh ]]; then
-  # shellcheck disable=SC1091
-  source /usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env.sh
-fi
+# shellcheck disable=SC1091
+source "$ROOT/scripts/ascend_env.sh"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 OUT="${OUT_DIR:-artifacts/ckpt_beauty_paper}"
