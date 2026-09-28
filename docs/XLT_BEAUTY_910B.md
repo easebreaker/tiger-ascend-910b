@@ -48,6 +48,10 @@ python -u scripts/npu_model_to_probe.py
 # smoke 若死在 p2 set_device：已默认跳过 set_device，只用 device='npu:0' 分配。
 #   git pull && export ASCEND_RT_VISIBLE_DEVICES=7
 #   bash scripts/run_xlt_beauty_910b.sh --probe-device   # 应看到 skip set_device 后 s7/s8 ok
+# 若死在 s7a / w2a zeros(1).npu()：是 ACL 建不上上下文（卡/驱动/挂载），不是 TIGER 代码：
+#   bash scripts/run_xlt_beauty_910b.sh --probe-acl
+#   npu-smi info   # 确认 VISIBLE 那张物理卡 Process 为空且 Health OK
+#   换一张空闲卡；并确认 set_env 后重做 修法2（driver/lib64 在 LD_LIBRARY_PATH 最前）
 #   bash scripts/run_xlt_beauty_910b.sh --smoke
 
 # 2) 冒烟（自动用 subset_512u + batch=2 + layout=npu_safe）
