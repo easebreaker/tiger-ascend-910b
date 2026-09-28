@@ -150,14 +150,36 @@ def npu_preflight(device_index: int = 0, log: bool = True) -> dict:
 
 
 def warmup_npu(device_index: int = 0, *, log: bool = True) -> None:
-    """Tiny tensor ops only (no Module.to / no set_device) before large T5 H2D."""
+    """Tiny tensor ops only (no Module.to / no set_device) before large T5 H2D.
+
+    First ACL context is created on the first real NPU alloc. Prefer
+    ``tensor.npu()`` (common Ascend sample) before ``device='npu:0'``.
+    """
     log_fn = print if log else (lambda *_a, **_k: None)
     npu_preflight(device_index, log=log)
+    vis = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    log_fn(
+        f"[warmup] note: logical npu:{device_index} → physical card "
+        f"from ASCEND_RT_VISIBLE_DEVICES={vis!r}; other cards' jobs "
+        f"should not matter IF this physical id is free (check npu-smi)",
+        flush=True,
+    )
     dev = f"npu:{int(device_index)}"
-    log_fn(f"[warmup] w2 empty tensor on {dev}", flush=True)
-    t = torch.empty(4, 4, device=dev)
-    log_fn("[warmup] w2b synchronize after first alloc", flush=True)
+
+    # w2a: host tensor then .npu() — official samples often use this.
+    log_fn("[warmup] w2a torch.zeros(1).npu()", flush=True)
+    t0 = torch.zeros(1, dtype=torch.float32).npu()
+    log_fn(f"[warmup] w2a ok device={t0.device}", flush=True)
+
+    log_fn("[warmup] w2b synchronize after first .npu()", flush=True)
     torch.npu.synchronize()
+    log_fn("[warmup] w2b ok", flush=True)
+
+    log_fn(f"[warmup] w2c empty(4,4, device={dev})", flush=True)
+    t = torch.empty(4, 4, device=dev)
+    torch.npu.synchronize()
+    log_fn(f"[warmup] w2c ok device={t.device}", flush=True)
+
     log_fn("[warmup] w3 randn + matmul", flush=True)
     x = torch.randn(8, 32, device=dev)
     y = x @ x.T
@@ -169,7 +191,7 @@ def warmup_npu(device_index: int = 0, *, log: bool = True) -> None:
     z = torch.addmm(b, x, w.T)
     torch.npu.synchronize()
     log_fn(f"[warmup] w4 ok z={tuple(z.shape)}", flush=True)
-    del t, x, y, w, b, z
+    del t0, t, x, y, w, b, z
     if hasattr(torch.npu, "empty_cache"):
         torch.npu.empty_cache()
     log_fn("[warmup] done", flush=True)
