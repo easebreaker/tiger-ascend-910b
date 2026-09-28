@@ -10,11 +10,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 
-def percentile(sorted_vals: List[float], p: float) -> Optional[float]:
-    """Nearest-rank percentile; ``p`` in [0, 100]. Input need not be pre-sorted."""
-    if not sorted_vals:
+def percentile(vals: List[float], p: float) -> Optional[float]:
+    """Nearest-rank percentile; ``p`` in [0, 100]."""
+    if not vals:
         return None
-    xs = sorted(sorted_vals)
+    xs = sorted(vals)
     if p <= 0:
         return float(xs[0])
     if p >= 100:
@@ -27,25 +27,54 @@ def percentile(sorted_vals: List[float], p: float) -> Optional[float]:
     return float(xs[f] * (c - k) + xs[c] * (k - f))
 
 
+def pct_dict_ms(times_s: List[float]) -> Dict[str, Optional[float]]:
+    if not times_s:
+        return {
+            "count": 0.0,
+            "mean": None,
+            "p50": None,
+            "p90": None,
+            "p99": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "count": float(len(times_s)),
+        "mean": (sum(times_s) / len(times_s) * 1000.0),
+        "p50": percentile(times_s, 50) * 1000.0,
+        "p90": percentile(times_s, 90) * 1000.0,
+        "p99": percentile(times_s, 99) * 1000.0,
+        "min": min(times_s) * 1000.0,
+        "max": max(times_s) * 1000.0,
+    }
+
+
 @dataclass
 class BenchReport:
+    """Unified report; inference fields are primary for scheduling claims."""
+
     strategy: str
+    mode: str  # infer | train
     nproc: int
     world_size: int
     rank: int
     device: str
     backend: str
-    steps: int
-    batch_size: int
-    grad_accum: int
-    global_batch: int
-    global_batch_mode: str
-    samples_seen: int
-    wall_s: float
-    phase_s: Dict[str, float] = field(default_factory=dict)
+    # infer
+    requests: int = 0
+    batch_size: int = 0
+    beam_size: int = 0
+    infer_op: str = ""  # generate | forward
+    latency_ms: Dict[str, Optional[float]] = field(default_factory=dict)
+    qps: Optional[float] = None  # requests / wall on this rank (or aggregate note)
+    aggregate_qps: Optional[float] = None  # cluster effective QPS
+    # train (optional)
+    steps: int = 0
     step_ms: Dict[str, Optional[float]] = field(default_factory=dict)
     samples_per_sec: Optional[float] = None
-    steps_per_sec: Optional[float] = None
+    # shared
+    wall_s: float = 0.0
+    phase_s: Dict[str, float] = field(default_factory=dict)
     peak_mem_bytes: Optional[int] = None
     peak_mem_gb: Optional[float] = None
     card_seconds: Optional[float] = None
@@ -70,7 +99,7 @@ class MetricsCollector:
         self._torch = torch
         self.device = device
         self.phase_s: Dict[str, float] = {}
-        self.step_times_s: List[float] = []
+        self.latencies_s: List[float] = []
         self._wall0 = time.perf_counter()
         self._reset_peak_mem()
 
@@ -107,51 +136,73 @@ class MetricsCollector:
         try:
             yield
         finally:
-            dt = time.perf_counter() - t0
-            self.phase_s[name] = self.phase_s.get(name, 0.0) + dt
+            self.phase_s[name] = self.phase_s.get(name, 0.0) + (time.perf_counter() - t0)
 
+    def record_latency(self, dt_s: float) -> None:
+        self.latencies_s.append(float(dt_s))
+
+    # alias for train-profile reuse
     def record_step(self, dt_s: float) -> None:
-        self.step_times_s.append(float(dt_s))
+        self.record_latency(dt_s)
 
     def wall_s(self) -> float:
         return time.perf_counter() - self._wall0
 
-    def step_percentiles_ms(self) -> Dict[str, Optional[float]]:
-        xs = list(self.step_times_s)
-        return {
-            "count": float(len(xs)),
-            "mean": (sum(xs) / len(xs) * 1000.0) if xs else None,
-            "p50": (percentile(xs, 50) * 1000.0) if xs else None,
-            "p90": (percentile(xs, 90) * 1000.0) if xs else None,
-            "p99": (percentile(xs, 99) * 1000.0) if xs else None,
-            "min": (min(xs) * 1000.0) if xs else None,
-            "max": (max(xs) * 1000.0) if xs else None,
-        }
-
-    def build_report(self, **kwargs: Any) -> BenchReport:
+    def build_infer_report(self, **kwargs: Any) -> BenchReport:
         wall = self.wall_s()
-        samples = int(kwargs.get("samples_seen", 0))
         nproc = int(kwargs.get("nproc", 1))
+        requests = int(kwargs.get("requests", 0))
         peak = self.peak_mem_bytes()
-        steps = int(kwargs.get("steps", len(self.step_times_s)))
+        rank_qps = (requests / wall) if wall > 0 else None
+        # For replicas: each rank serves requests/nproc; aggregate ≈ rank_qps * nproc if balanced
+        agg = kwargs.get("aggregate_qps")
+        if agg is None and rank_qps is not None and kwargs.get("strategy") == "replicas":
+            agg = rank_qps * max(1, nproc)
+        elif agg is None:
+            agg = rank_qps
         return BenchReport(
             strategy=str(kwargs.get("strategy", "")),
+            mode="infer",
+            nproc=nproc,
+            world_size=int(kwargs.get("world_size", nproc)),
+            rank=int(kwargs.get("rank", 0)),
+            device=str(kwargs.get("device", self.device)),
+            backend=str(kwargs.get("backend", "")),
+            requests=requests,
+            batch_size=int(kwargs.get("batch_size", 0)),
+            beam_size=int(kwargs.get("beam_size", 0)),
+            infer_op=str(kwargs.get("infer_op", "")),
+            latency_ms=pct_dict_ms(self.latencies_s),
+            qps=rank_qps,
+            aggregate_qps=agg,
+            wall_s=wall,
+            phase_s=dict(self.phase_s),
+            peak_mem_bytes=peak,
+            peak_mem_gb=(peak / 1e9) if peak is not None else None,
+            card_seconds=wall * max(1, nproc),
+            notes=str(kwargs.get("notes", "")),
+            extra=dict(kwargs.get("extra") or {}),
+        )
+
+    def build_train_report(self, **kwargs: Any) -> BenchReport:
+        wall = self.wall_s()
+        nproc = int(kwargs.get("nproc", 1))
+        samples = int(kwargs.get("samples_seen", 0))
+        steps = int(kwargs.get("steps", len(self.latencies_s)))
+        peak = self.peak_mem_bytes()
+        return BenchReport(
+            strategy=str(kwargs.get("strategy", "train_profile")),
+            mode="train",
             nproc=nproc,
             world_size=int(kwargs.get("world_size", nproc)),
             rank=int(kwargs.get("rank", 0)),
             device=str(kwargs.get("device", self.device)),
             backend=str(kwargs.get("backend", "")),
             steps=steps,
-            batch_size=int(kwargs.get("batch_size", 0)),
-            grad_accum=int(kwargs.get("grad_accum", 1)),
-            global_batch=int(kwargs.get("global_batch", 0)),
-            global_batch_mode=str(kwargs.get("global_batch_mode", "")),
-            samples_seen=samples,
+            step_ms=pct_dict_ms(self.latencies_s),
+            samples_per_sec=(samples / wall) if wall > 0 else None,
             wall_s=wall,
             phase_s=dict(self.phase_s),
-            step_ms=self.step_percentiles_ms(),
-            samples_per_sec=(samples / wall) if wall > 0 else None,
-            steps_per_sec=(steps / wall) if wall > 0 and steps else None,
             peak_mem_bytes=peak,
             peak_mem_gb=(peak / 1e9) if peak is not None else None,
             card_seconds=wall * max(1, nproc),

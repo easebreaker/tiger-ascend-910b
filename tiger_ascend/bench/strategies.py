@@ -1,25 +1,37 @@
-"""Allocation / parallel strategies for sched bench."""
+"""Allocation / parallel strategies for sched bench (inference-first)."""
 
 from __future__ import annotations
 
 from typing import Dict, List
 
-# Strategies exposed on CLI. TP/PP/EP are documented as unsupported for this
-# workload (negative boundary) — selecting them exits with a structured report.
+# Inference-first strategies for multi-chip *scheduling* experiments.
+# Small TIGER (~5M) does not use model-parallel serving; replicas = multi-copy.
 STRATEGIES: Dict[str, str] = {
-    "single": "1-card training baseline (full model replica, all steps)",
-    "dp": "Data Parallel (DDP): each card trains different shards, grads allreduce",
-    "overalloc": (
-        "Request N cards via torchrun but only rank0 trains; others idle at barrier. "
-        "Measures scheduling waste of over-allocating small jobs."
+    "single": (
+        "1-card inference baseline: full model replica, measure latency/QPS/HBM"
     ),
-    "tp": "UNSUPPORTED boundary: Tensor Parallel — not applicable to ~5M T5",
-    "pp": "UNSUPPORTED boundary: Pipeline Parallel — not applicable",
+    "replicas": (
+        "Multi-replica serving (data-parallel at request level): N cards each hold "
+        "a full copy and serve a shard of requests — the practical scale-out for small models"
+    ),
+    "overalloc": (
+        "Reserve N cards via torchrun but only rank0 serves; others idle. "
+        "Measures scheduler waste when small inference jobs are over-granted chips"
+    ),
+    "train_profile": (
+        "Optional short training-step profile (secondary). Not the primary scheduling signal."
+    ),
+    "tp": "UNSUPPORTED boundary: Tensor Parallel serving — not for ~5M T5",
+    "pp": "UNSUPPORTED boundary: Pipeline Parallel serving — not applicable",
     "ep": "UNSUPPORTED boundary: Expert Parallel — model is not MoE",
-    "sp": "UNSUPPORTED boundary: Sequence Parallel — seq len too short",
+    "sp": "UNSUPPORTED boundary: Sequence Parallel — seq too short",
 }
 
 StrategyName = str
 
-SUPPORTED_RUNNABLE: List[str] = ["single", "dp", "overalloc"]
+# Primary matrix for multi-chip scheduling claims
+SUPPORTED_INFER: List[str] = ["single", "replicas", "overalloc"]
+# Optional secondary
+SUPPORTED_TRAIN: List[str] = ["train_profile"]
+SUPPORTED_RUNNABLE: List[str] = SUPPORTED_INFER + SUPPORTED_TRAIN
 BOUNDARY_UNSUPPORTED: List[str] = ["tp", "pp", "ep", "sp"]

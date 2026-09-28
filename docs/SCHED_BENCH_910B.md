@@ -1,77 +1,63 @@
-# 多芯调度实验台（TIGER / Ascend 910B）
+# 多芯调度实验台（推理优先 / Ascend 910B）
 
-面向组内「多芯调度」方向：用 **可参数指定的分配策略** 跑完一组可汇报实验，自动采集 **P50/P90/P99、加速比、峰值显存、分段耗时、卡时浪费**。
+面向组内「多芯调度」：**以推理服务为主**（延迟分位、QPS、占卡浪费、多副本扩展），训练仅可选短画像。
 
-入口：
+> 旧版以训练 step 为主；现已改为推理优先。全量 Beauty Hit@K 仍用 `run_xlt_beauty_910b.sh`，与本 bench 分离。
 
-- `scripts/sched_bench.py` — 单次策略跑测
-- `scripts/run_sched_bench.sh` — 一键矩阵（single / overalloc / dp + tp|pp|ep|sp 边界）
-- `scripts/summarize_sched_bench.py` — 汇总 `summary.csv` / `summary.md`
+## 为什么偏推理
+
+调度日常面对的是 **持续占卡的 serving**（含与 vLLM-TP 共机），不是偶发训练。小模型 TIGER 的正确扩展是 **多副本完整模型**，不是 TP/PP。
 
 ## 策略（`--strategy`）
 
-| 策略 | 含义 | 调度实验目的 |
+| 策略 | 含义 | 调度结论 |
 |---|---|---|
-| `single` | 单卡基线 | 吞吐 / 显存 / step 延迟画像 |
-| `dp` | DDP 数据并行 | 加速比与并行效率（强/弱缩放） |
-| `overalloc` | torchrun N 进程，仅 rank0 训练 | **多占卡浪费**（负向调度案例） |
-| `tp`/`pp`/`ep`/`sp` | **不实现**，写 boundary JSON | 小模型不适用模型并行的边界结论 |
+| `single` | 单卡推理基线 | P50/P90/P99、QPS、峰值显存 |
+| `replicas` | N 卡各一份完整模型，请求分片 | 小模型水平扩展加速比/效率 |
+| `overalloc` | 占 N 卡仅 1 卡服务 | **配额浪费** |
+| `tp`/`pp`/`ep`/`sp` | 边界 JSON（不实现） | 本负载不适用模型并行 |
+| `train_profile` | 可选短训练画像 | 次要；默认矩阵不跑 |
 
-TP/PP/EP/SP 不会空跑假实现；输出结构化「不适用」报告，避免虚假工作量，同时保留可引用的边界结论。
+## 采集指标
 
-## 指标
+- `latency_ms`: **p50 / p90 / p99**（请求 batch 耗时）
+- `qps` / **`aggregate_qps`**（集群有效吞吐）
+- `peak_mem_gb`、`phase_s`（data / init_model / infer）
+- `card_seconds`、`speedup_vs_baseline`、`parallel_efficiency`
+- `extra.waste_factor`（overalloc）
 
-每个成功 run 写一份 JSON（`artifacts/sched_bench/...`），含：
-
-- `step_ms`: mean / **p50 / p90 / p99** / min / max（去掉 `--warmup_steps`）
-- `samples_per_sec` / `steps_per_sec`
-- `peak_mem_bytes` / `peak_mem_gb`（`torch.npu.max_memory_allocated`）
-- `phase_s`: `data` / `init_model` / `train`
-- `wall_s` / `card_seconds`（`wall × nproc`）
-- `speedup_vs_baseline`（相对 `--baseline_json` 的 single）
-- `parallel_efficiency`（DP：speedup/nproc；overalloc：同）
-- `extra.waste_factor`（overalloc：nproc/speedup）
-
-## 一键跑矩阵
+## 一键矩阵
 
 ```bash
-# 选空闲卡（例：4 张）
-export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-bash scripts/run_sched_bench.sh          # 默认 50 step
+git pull
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7   # 空闲卡
+# 可选：用已训权重更贴近业务
+# export CKPT=artifacts/ckpt_beauty_xlt/pytorch_model.bin
+bash scripts/run_sched_bench.sh
 # 或
-STEPS=30 bash scripts/run_sched_bench.sh --quick
+REQUESTS=32 bash scripts/run_sched_bench.sh --quick
+
+# 若也要附带训练短画像：
+TRAIN_PROFILE=1 bash scripts/run_sched_bench.sh --quick
 ```
 
-脚本会：
+输出目录：`artifacts/sched_bench/<timestamp>/summary.md`
 
-1. 写出 `tp/pp/ep/sp` boundary JSON  
-2. 跑 `single` 基线  
-3. 若可见卡 ≥2/4：跑 `overalloc` 与 `dp`（fixed + weak）  
-4. 生成 `summary.md` / `summary.csv`
+## 与业务怎么对齐
 
-手动单条：
+1. 训练出 ckpt（可另开全量 Beauty）→ 业务指标  
+2. 用同一 ckpt 跑本矩阵 → **调度策略数据**（单卡 vs 多副本 vs 多占卡浪费）  
+3. 汇报：推荐「小模型默认 1 卡；要吞吐用 replicas；禁止对本负载开 TP/PP；避免 overalloc」
+
+## 手动单条
 
 ```bash
 source scripts/ascend_env.sh
 export ASCEND_RT_VISIBLE_DEVICES=7
-python -u scripts/sched_bench.py --strategy single --device npu --steps 30 --tag baseline
+python -u scripts/sched_bench.py --strategy single --device npu \
+  --requests 64 --batch_size 8 --infer_op generate --beam_size 10
 
 ASCEND_RT_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 \
-  scripts/sched_bench.py --strategy dp --device npu --steps 30 \
-  --global_batch_mode fixed --target_global_batch 32 \
+  scripts/sched_bench.py --strategy replicas --device npu --requests 128 \
   --baseline_json artifacts/sched_bench/<run>/single_n1_baseline.json
 ```
-
-## 汇报可用结论模板
-
-1. **单卡画像**：峰值显存 ≪ 单卡容量 → 无「必须切模型」动机。  
-2. **overalloc**：speedup≈1 而 card_seconds×N → 小任务多卡独占浪费。  
-3. **DP**：给出 2/4 卡加速比与效率；效率随卡数下降则说明通信占比高。  
-4. **边界**：TP/PP/EP/SP 对 ~5M T5 + 短 SID **不适用**（已用 footprint + 策略枚举固化）。
-
-## 注意
-
-- 必须经 `ascend_env.sh`（driver lib64 置顶）；不要对 NPU 调 `set_device`（本 bench 已避开）。  
-- 不要与 `vllmworker-tp` 抢同一物理卡。  
-- NPU 上 `num_workers` 保持 0。  
-- 本 bench 测的是 **训练 step 吞吐与调度分配**，不是 Beauty 全量 Hit@K（全量测算仍用 `run_xlt_beauty_910b.sh`）。
