@@ -31,17 +31,12 @@
 ```bash
 git pull
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7   # 空闲卡
-# 可选：用已训权重更贴近业务
-# export CKPT=artifacts/ckpt_beauty_xlt/pytorch_model.bin
+# 可选：export CKPT=artifacts/ckpt_beauty_xlt/pytorch_model.bin
 bash scripts/run_sched_bench.sh
-# 或
-REQUESTS=32 bash scripts/run_sched_bench.sh --quick
-
-# 若也要附带训练短画像：
-TRAIN_PROFILE=1 bash scripts/run_sched_bench.sh --quick
 ```
 
-输出目录：`artifacts/sched_bench/<timestamp>/summary.md`
+**多卡不再使用 torchrun/HCCL**（易触发 `hcclCommInitRootInfoConfig error code 1`）。  
+改为 `launch_infer_mp.sh`：每张卡一个独立进程，`ASCEND_RT_VISIBLE_DEVICES=<单卡>` → 逻辑 `npu:0`。这更接近真实「多副本推理」调度形态。
 
 ## 与业务怎么对齐
 
@@ -57,7 +52,13 @@ export ASCEND_RT_VISIBLE_DEVICES=7
 python -u scripts/sched_bench.py --strategy single --device npu \
   --requests 64 --batch_size 8 --infer_op generate --beam_size 10
 
-ASCEND_RT_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 \
-  scripts/sched_bench.py --strategy replicas --device npu --requests 128 \
-  --baseline_json artifacts/sched_bench/<run>/single_n1_baseline.json
+# 多副本（无 HCCL）：
+DEVICES=4,5 ROLE=replicas OUT_DIR=artifacts/sched_bench/manual \
+  bash scripts/launch_infer_mp.sh --strategy replicas --device npu \
+  --data_dir data/amazon_beauty/subset_512u --out_dir artifacts/sched_bench/manual \
+  --requests 64 --batch_size 8
 ```
+
+### HCCL / torchrun 说明
+
+本实验台的 `replicas`/`overalloc` **故意不用 HCCL**。若你另有训练 DDP 需求再单独配 `MASTER_ADDR`/`HCCL_IF_IP` 等；与本推理调度矩阵无关。

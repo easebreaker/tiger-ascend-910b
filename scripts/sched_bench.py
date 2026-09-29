@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
 """Multi-chip scheduling bench — inference-first (TIGER / Ascend 910B).
 
-Primary strategies (scheduling claims):
-  single      1-card inference baseline (latency P50/P90/P99, QPS, HBM)
-  replicas    N full-model copies; shard requests (small-model scale-out)
-  overalloc   N cards reserved, only rank0 serves (quota waste)
+Primary strategies (NO HCCL required for multi-card):
+  single / replicas / overalloc  — use launch_infer_mp.sh for multi-card
+  tp|pp|ep|sp                    — boundary JSON only
+  train_profile                  — optional single-card train short profile
 
-Boundary (JSON only): tp | pp | ep | sp
-
-Optional secondary:
-  train_profile  short training-step profile (not primary)
-
-Examples:
-  source scripts/ascend_env.sh
-  export ASCEND_RT_VISIBLE_DEVICES=7
-  python -u scripts/sched_bench.py --strategy single --device npu --requests 64
-
-  ASCEND_RT_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=2 \\
-    scripts/sched_bench.py --strategy replicas --device npu --requests 128 \\
-    --baseline_json artifacts/sched_bench/.../single_*.json
+Multi-card inference intentionally avoids torchrun+HCCL (error code 1 on many
+boxes). Each process gets one ASCEND_RT_VISIBLE_DEVICES id → logical npu:0.
 """
 
 from __future__ import annotations
@@ -28,7 +17,7 @@ import json
 import os
 import sys
 import time
-from typing import List, Optional, Tuple
+from pathlib import Path
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
@@ -49,24 +38,25 @@ def parse_args():
     p.add_argument("--device", choices=["npu", "cuda", "cpu"], default="npu")
     p.add_argument("--data_dir", default=os.path.join(ROOT, "data", "amazon_beauty", "subset_512u"))
     p.add_argument("--out_dir", default=os.path.join(ROOT, "artifacts", "sched_bench"))
-    p.add_argument("--ckpt", default="", help="optional pytorch_model.bin (else random init)")
-    # infer
-    p.add_argument("--requests", type=int, default=64, help="total request batches to serve (cluster)")
-    p.add_argument("--batch_size", type=int, default=8, help="sequences per request batch")
+    p.add_argument("--ckpt", default="", help="optional pytorch_model.bin")
+    p.add_argument("--requests", type=int, default=64, help="cluster total request batches")
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--warmup_requests", type=int, default=5)
     p.add_argument("--infer_op", choices=["generate", "forward"], default="generate")
-    p.add_argument("--beam_size", type=int, default=10, help="generate beam (keep modest for bench)")
+    p.add_argument("--beam_size", type=int, default=10)
     p.add_argument("--max_new_tokens", type=int, default=5)
-    # train_profile only
     p.add_argument("--steps", type=int, default=30)
     p.add_argument("--warmup_steps", type=int, default=3)
     p.add_argument("--grad_accum", type=int, default=1)
-    # model
     p.add_argument("--layout", choices=["npu_safe", "xlt", "npu_large"], default="npu_safe")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--baseline_json", default="")
     p.add_argument("--tag", default="")
+    # Independent multi-process (no HCCL) — set by launch_infer_mp.sh
+    p.add_argument("--mp_rank", type=int, default=0)
+    p.add_argument("--mp_world_size", type=int, default=1)
+    p.add_argument("--mp_role", choices=["", "replicas", "overalloc"], default="")
     return p.parse_args()
 
 
@@ -112,6 +102,11 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"[sched-bench] {args.strategy}: {STRATEGIES[args.strategy]}", flush=True)
+    print(
+        f"[sched-bench] visible={os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!r} "
+        f"mp_rank={args.mp_rank}/{args.mp_world_size} role={args.mp_role!r}",
+        flush=True,
+    )
 
     if args.strategy in BOUNDARY_UNSUPPORTED:
         _write_boundary(args)
@@ -120,10 +115,9 @@ def main():
         raise SystemExit(f"unsupported strategy {args.strategy}")
 
     import torch
-    from torch.utils.data import DataLoader, DistributedSampler, Subset
+    from torch.utils.data import DataLoader
     from transformers import T5ForConditionalGeneration
 
-    from tiger_ascend.bench.dist_utils import barrier, cleanup_dist, init_dist, is_main
     from tiger_ascend.bench.metrics import MetricsCollector
     from tiger_ascend.data.dataset import load_json
     from tiger_ascend.data.xlt import XLT_EOS_ID, XLT_PAD_ID, XLT_VOCAB_SIZE, XltSeqDataset
@@ -135,36 +129,55 @@ def main():
         warmup_npu,
     )
 
-    if args.strategy in {"replicas", "overalloc"} and int(os.environ.get("WORLD_SIZE", "1")) <= 1:
-        print(
-            "[sched-bench] WARNING: replicas/overalloc expect torchrun --nproc_per_node>1",
-            flush=True,
-        )
-
-    dist = init_dist(args.device)
-    if args.device == "npu" and not dist.enabled:
+    # Resolve logical device: with one visible card, always npu:0 / cuda:0
+    if args.device == "npu":
+        device = torch.device("npu:0")
         try:
-            warmup_npu(0, log=is_main(dist))
+            warmup_npu(0, log=(args.mp_rank == 0))
         except Exception as e:
             print(f"[sched-bench] warmup warn: {e!r}", flush=True)
+    elif args.device == "cuda":
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
 
-    metrics = MetricsCollector(dist.device)
+    mp_n = max(1, int(args.mp_world_size))
+    mp_r = int(args.mp_rank)
+    role = args.mp_role or args.strategy
+
+    # overalloc idle ranks: hold device context until rank0 finishes
+    done_flag = Path(args.out_dir) / f".overalloc_done_n{mp_n}"
+    if args.strategy == "overalloc" and mp_r > 0:
+        print(f"[sched-bench] overalloc idle rank={mp_r} holding {device}", flush=True)
+        holder = None
+        if device.type != "cpu":
+            holder = torch.zeros(1, device=device)
+            if device.type == "npu":
+                torch.npu.synchronize()
+        t0 = time.perf_counter()
+        while not done_flag.exists():
+            time.sleep(0.5)
+            if time.perf_counter() - t0 > 7200:
+                raise SystemExit("overalloc idle timeout waiting for rank0")
+        del holder
+        print(f"[sched-bench] idle rank={mp_r} exit", flush=True)
+        return
+
+    metrics = MetricsCollector(device)
 
     with metrics.phase("data"):
         inters = load_json(os.path.join(args.data_dir, "inter.json"))
         indices = load_json(os.path.join(args.data_dir, "semantic_ids.json"))
-        # valid split ≈ inference traffic shape
         ds = XltSeqDataset(inters, indices, max_his_len=20, mode="valid")
         if len(ds) == 0:
             ds = XltSeqDataset(inters, indices, max_his_len=20, mode="train")
 
-    active = True
-    if args.strategy == "overalloc":
-        active = dist.rank == 0
-
-    def build_model():
+    def build_model(train_mode: bool = False):
         cfg = build_xlt_t5_config(
-            XLT_VOCAB_SIZE, dropout_rate=0.0, layout=args.layout, use_cache=True
+            XLT_VOCAB_SIZE,
+            dropout_rate=0.1 if train_mode else 0.0,
+            layout=args.layout,
+            use_cache=not train_mode,
         )
         try:
             model = T5ForConditionalGeneration(cfg, attn_implementation="eager")
@@ -175,49 +188,49 @@ def main():
         if args.ckpt:
             state = torch.load(args.ckpt, map_location="cpu")
             model.load_state_dict(state, strict=False)
-        if dist.device.type == "npu":
-            prepare_npu_runtime(dist.device.index or 0, log=False)
-            _ = torch.zeros(1, device=dist.device)
+        if device.type == "npu":
+            prepare_npu_runtime(0, log=False)
+            _ = torch.zeros(1, device=device)
             torch.npu.synchronize()
             model = move_module_to_device_safe(
-                model, dist.device, log=False, sync_each=False, strategy="copy_"
+                model, device, log=False, sync_each=False, strategy="copy_"
             )
         else:
-            model.to(dist.device)
-        model.eval()
+            model.to(device)
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
         return model
 
-    # ---------- inference paths ----------
+    # ---------- inference ----------
     if args.strategy in SUPPORTED_INFER:
-        model = None
-        if active:
-            with metrics.phase("init_model"):
-                torch.manual_seed(args.seed + dist.rank)
-                model = build_model()
+        with metrics.phase("init_model"):
+            torch.manual_seed(args.seed + mp_r)
+            model = build_model(False)
 
-        # Shard requests across replicas; overalloc/single: all requests on active rank
-        if args.strategy == "replicas" and dist.world_size > 1:
-            # each rank handles ceil(total/world) batches
-            local_reqs = (args.requests + dist.world_size - 1) // dist.world_size
+        if args.strategy == "replicas" and mp_n > 1:
+            # shard cluster requests across ranks
+            local_reqs = args.requests // mp_n + (1 if mp_r < (args.requests % mp_n) else 0)
         else:
-            local_reqs = args.requests if active else 0
+            local_reqs = args.requests
 
-        sampler = None
-        if args.strategy == "replicas" and dist.enabled and dist.world_size > 1 and active:
-            sampler = DistributedSampler(
-                ds, num_replicas=dist.world_size, rank=dist.rank, shuffle=False
-            )
+        # Deterministic shard of dataset indices per rank
+        indices_all = list(range(len(ds)))
+        if args.strategy == "replicas" and mp_n > 1:
+            indices_all = indices_all[mp_r::mp_n] or indices_all
+        from torch.utils.data import Subset
 
+        subset = Subset(ds, indices_all)
         loader = DataLoader(
-            ds,
+            subset,
             batch_size=args.batch_size,
             shuffle=False,
-            sampler=sampler,
             collate_fn=ds.get_collate_fn(),
             num_workers=args.num_workers,
             drop_last=True,
         )
-        it = iter(loader) if active else None
+        it = iter(loader)
 
         def next_batch():
             nonlocal it
@@ -227,28 +240,20 @@ def main():
                 it = iter(loader)
                 return next(it)
 
-        barrier(dist)
         done = 0
         with metrics.phase("infer"), torch.no_grad():
-            # idle ranks still barrier-sync for overalloc card hold
-            target = local_reqs if active else args.requests
-            for i in range(1, (local_reqs if active else args.requests) + 1):
-                if not active:
-                    barrier(dist)
-                    continue
+            for _ in range(local_reqs):
                 batch = next_batch()
-                batch = move_batch_to_device(
-                    {k: v for k, v in batch.items() if k != "labels"},
-                    dist.device,
-                    non_blocking=False,
-                )
                 t0 = time.perf_counter()
                 if args.infer_op == "forward":
-                    # cheap path: teacher-forcing style forward if labels present
-                    full = next_batch()
-                    full = move_batch_to_device(full, dist.device, non_blocking=False)
+                    full = move_batch_to_device(batch, device, non_blocking=False)
                     _ = model(**full).loss
                 else:
+                    batch = move_batch_to_device(
+                        {k: v for k, v in batch.items() if k != "labels"},
+                        device,
+                        non_blocking=False,
+                    )
                     _ = model.generate(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
@@ -259,75 +264,78 @@ def main():
                         pad_token_id=XLT_PAD_ID,
                         decoder_start_token_id=XLT_PAD_ID,
                     )
-                if dist.device.type == "npu":
+                if device.type == "npu":
                     torch.npu.synchronize()
-                elif dist.device.type == "cuda":
+                elif device.type == "cuda":
                     torch.cuda.synchronize()
                 dt = time.perf_counter() - t0
                 done += 1
                 if done > args.warmup_requests:
                     metrics.record_latency(dt)
-                if is_main(dist) and (done % 10 == 0 or done == local_reqs):
+                if done % 10 == 0 or done == local_reqs:
                     print(
-                        f"[sched-bench] infer {args.strategy} "
+                        f"[sched-bench] rank={mp_r} {args.strategy} "
                         f"req={done}/{local_reqs} last_ms={dt*1000:.1f}",
                         flush=True,
                     )
-                barrier(dist)
 
-        barrier(dist)
-        if is_main(dist):
-            # For replicas, aggregate QPS ≈ sum of per-rank; approximate as
-            # (total requests) / wall using main rank wall and full request count.
-            nproc = dist.world_size
-            notes = ""
-            if args.strategy == "overalloc":
-                notes = f"overalloc: held={nproc} serving_replicas=1"
-            if args.strategy == "replicas":
-                notes = f"replicas: full-model copies={nproc} (not TP)"
+        if args.strategy == "overalloc" and mp_r == 0:
+            done_flag.write_text("ok")
 
-            # Rebuild collector wall is from main only; use requests=cluster total for agg
-            report = metrics.build_infer_report(
-                strategy=args.strategy,
-                nproc=nproc,
-                world_size=dist.world_size,
-                rank=dist.rank,
-                device=str(dist.device),
-                backend=dist.backend,
-                requests=done if args.strategy != "replicas" else args.requests,
-                batch_size=args.batch_size,
-                beam_size=args.beam_size if args.infer_op == "generate" else 0,
-                infer_op=args.infer_op,
-                notes=notes,
-                extra={
-                    "data_dir": args.data_dir,
-                    "ckpt": args.ckpt or None,
-                    "layout": args.layout,
-                    "local_requests": done,
-                    "cluster_requests": args.requests,
-                    "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
-                    "strategy_doc": STRATEGIES[args.strategy],
-                },
-            )
-            if args.strategy == "replicas" and report.wall_s > 0:
-                # Effective cluster QPS: all ranks finish ~same wall; total req / wall
-                report.aggregate_qps = args.requests / report.wall_s
-                report.qps = (done / report.wall_s) if report.wall_s > 0 else None
-            _attach_speedup(report, args, nproc, metric_key="aggregate_qps")
-            tag = args.tag or f"w{nproc}"
-            out = os.path.join(args.out_dir, f"{args.strategy}_n{nproc}_{tag}.json")
-            report.save(out)
-            print(f"[sched-bench] wrote {out}", flush=True)
-            print(json.dumps(report.to_dict(), indent=2), flush=True)
-        cleanup_dist(dist)
+        nproc = mp_n if args.strategy in {"replicas", "overalloc"} else 1
+        notes = ""
+        if args.strategy == "overalloc":
+            notes = f"overalloc: held={nproc} serving=1 (no HCCL; independent procs)"
+        if args.strategy == "replicas":
+            notes = f"replicas: copies={nproc} independent procs (no HCCL)"
+
+        report = metrics.build_infer_report(
+            strategy=args.strategy,
+            nproc=nproc,
+            world_size=mp_n,
+            rank=mp_r,
+            device=str(device),
+            backend="none-mp",
+            requests=done,
+            batch_size=args.batch_size,
+            beam_size=args.beam_size if args.infer_op == "generate" else 0,
+            infer_op=args.infer_op,
+            notes=notes,
+            extra={
+                "data_dir": args.data_dir,
+                "ckpt": args.ckpt or None,
+                "layout": args.layout,
+                "local_requests": done,
+                "cluster_requests": args.requests,
+                "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+                "mp_rank": mp_r,
+                "mp_world_size": mp_n,
+                "strategy_doc": STRATEGIES[args.strategy],
+                "hccl": False,
+            },
+        )
+        # Per-rank QPS; cluster agg filled later by summarize for replicas
+        if report.wall_s > 0:
+            report.qps = done / report.wall_s
+            if args.strategy == "single":
+                report.aggregate_qps = report.qps
+            elif args.strategy == "overalloc":
+                report.aggregate_qps = report.qps  # only one server
+            else:
+                # provisional; summarize will sum ranks
+                report.aggregate_qps = report.qps * mp_n
+        _attach_speedup(report, args, nproc, metric_key="aggregate_qps")
+        tag = args.tag or f"w{nproc}"
+        out = os.path.join(args.out_dir, f"{args.strategy}_n{nproc}_{tag}.json")
+        report.save(out)
+        print(f"[sched-bench] wrote {out}", flush=True)
+        print(json.dumps(report.to_dict(), indent=2), flush=True)
         return
 
-    # ---------- optional train_profile ----------
+    # ---------- optional train_profile (single card) ----------
     if args.strategy in SUPPORTED_TRAIN:
-        from torch.utils.data import DataLoader as DL
-
         train_ds = XltSeqDataset(inters, indices, max_his_len=20, mode="train")
-        loader = DL(
+        loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
             shuffle=True,
@@ -336,8 +344,7 @@ def main():
             drop_last=True,
         )
         with metrics.phase("init_model"):
-            model = build_model()
-            model.train()
+            model = build_model(True)
             optim = torch.optim.Adam(model.parameters(), lr=1e-4)
         it = iter(loader)
         with metrics.phase("train"):
@@ -348,37 +355,33 @@ def main():
                 except StopIteration:
                     it = iter(loader)
                     batch = next(it)
-                batch = move_batch_to_device(batch, dist.device, non_blocking=False)
+                batch = move_batch_to_device(batch, device, non_blocking=False)
                 loss = model(**batch).loss
                 loss.backward()
                 optim.step()
                 optim.zero_grad(set_to_none=True)
-                if dist.device.type == "npu":
+                if device.type == "npu":
                     torch.npu.synchronize()
                 dt = time.perf_counter() - t0
                 if step > args.warmup_steps:
                     metrics.record_step(dt)
-        if is_main(dist):
-            report = metrics.build_train_report(
-                strategy="train_profile",
-                nproc=1,
-                world_size=1,
-                rank=0,
-                device=str(dist.device),
-                backend=dist.backend,
-                steps=args.steps,
-                samples_seen=args.steps * args.batch_size,
-                notes="secondary training profile only",
-                extra={"layout": args.layout},
-            )
-            _attach_speedup(report, args, 1, metric_key="samples_per_sec")
-            tag = args.tag or "train"
-            out = os.path.join(args.out_dir, f"train_profile_n1_{tag}.json")
-            report.save(out)
-            print(f"[sched-bench] wrote {out}", flush=True)
-            print(json.dumps(report.to_dict(), indent=2), flush=True)
-        cleanup_dist(dist)
-        return
+        report = metrics.build_train_report(
+            strategy="train_profile",
+            nproc=1,
+            world_size=1,
+            rank=0,
+            device=str(device),
+            backend="none",
+            steps=args.steps,
+            samples_seen=args.steps * args.batch_size,
+            notes="secondary training profile only",
+            extra={"layout": args.layout},
+        )
+        tag = args.tag or "train"
+        out = os.path.join(args.out_dir, f"train_profile_n1_{tag}.json")
+        report.save(out)
+        print(f"[sched-bench] wrote {out}", flush=True)
+        print(json.dumps(report.to_dict(), indent=2), flush=True)
 
 
 if __name__ == "__main__":

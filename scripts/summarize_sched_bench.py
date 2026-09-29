@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate sched_bench JSON (infer-first) into summary.csv + summary.md."""
+"""Aggregate sched_bench JSON (infer-first, no-HCCL multi-process) into summary."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import argparse
 import csv
 import json
 import os
+import re
+from collections import defaultdict
 from typing import Any, Dict, List
 
 
@@ -15,11 +17,84 @@ def load_reports(in_dir: str) -> List[Dict[str, Any]]:
     for name in sorted(os.listdir(in_dir)):
         if not name.endswith(".json"):
             continue
+        if name.startswith("."):
+            continue
         with open(os.path.join(in_dir, name), encoding="utf-8") as f:
             data = json.load(f)
         data["_file"] = name
         rows.append(data)
     return rows
+
+
+def merge_replica_shards(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Combine replicas_nK_mpK_r* into one cluster row with summed QPS."""
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    others: List[Dict[str, Any]] = []
+    for r in rows:
+        if r.get("supported") is False:
+            others.append(r)
+            continue
+        m = re.match(r"replicas_n(\d+)_mp\d+_r(\d+)\.json", r.get("_file", ""))
+        if r.get("strategy") == "replicas" and m:
+            key = f"replicas_n{m.group(1)}"
+            groups[key].append(r)
+        else:
+            others.append(r)
+
+    merged: List[Dict[str, Any]] = []
+    for key, parts in groups.items():
+        if len(parts) == 1:
+            merged.append(parts[0])
+            continue
+        walls = [float(p.get("wall_s") or 0) for p in parts]
+        qps_list = [float(p.get("qps") or 0) for p in parts]
+        local_reqs = [int((p.get("extra") or {}).get("local_requests") or p.get("requests") or 0) for p in parts]
+        peak = max((p.get("peak_mem_gb") or 0) for p in parts)
+        # Prefer sum of per-rank QPS; also total_req / max_wall
+        sum_qps = sum(qps_list)
+        total_req = sum(local_reqs)
+        max_wall = max(walls) if walls else 0
+        alt = (total_req / max_wall) if max_wall > 0 else sum_qps
+        # Use min of the two conservative? Use sum_qps as primary for independent serving
+        agg = sum_qps
+        # latency: pool all ranks' p50 etc by averaging reported p50
+        def avg_lat(k):
+            vals = []
+            for p in parts:
+                lat = p.get("latency_ms") or {}
+                if lat.get(k) is not None:
+                    vals.append(lat[k])
+            return sum(vals) / len(vals) if vals else None
+
+        nproc = int(parts[0].get("nproc") or len(parts))
+        row = {
+            "_file": f"{key}_merged.json",
+            "strategy": "replicas",
+            "mode": "infer",
+            "nproc": nproc,
+            "infer_op": parts[0].get("infer_op"),
+            "batch_size": parts[0].get("batch_size"),
+            "qps": sum_qps / max(1, len(parts)),
+            "aggregate_qps": agg,
+            "latency_ms": {
+                "p50": avg_lat("p50"),
+                "p90": avg_lat("p90"),
+                "p99": avg_lat("p99"),
+            },
+            "peak_mem_gb": peak,
+            "wall_s": max_wall,
+            "card_seconds": max_wall * nproc,
+            "phase_s": {},
+            "extra": {
+                "merged_from": [p.get("_file") for p in parts],
+                "alt_qps_total_req_over_max_wall": alt,
+                "waste_factor": None,
+            },
+            "notes": f"merged {len(parts)} independent replica ranks (no HCCL)",
+        }
+        # persist merged
+        merged.append(row)
+    return others + merged
 
 
 def main():
@@ -29,19 +104,24 @@ def main():
     args = p.parse_args()
     out_dir = args.out_dir or args.in_dir
     os.makedirs(out_dir, exist_ok=True)
-    rows = load_reports(args.in_dir)
+    rows = merge_replica_shards(load_reports(args.in_dir))
+
+    # write merged replicas artifacts
+    for r in rows:
+        if r.get("_file", "").endswith("_merged.json"):
+            path = os.path.join(out_dir, r["_file"])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(r, f, indent=2)
 
     baseline_qps = None
     for r in rows:
-        if r.get("strategy") == "single" and r.get("mode", "infer") == "infer":
+        if r.get("strategy") == "single" and r.get("mode", "infer") != "train":
             baseline_qps = r.get("aggregate_qps") or r.get("qps")
             if baseline_qps:
                 break
 
     for r in rows:
         if r.get("supported") is False:
-            continue
-        if r.get("mode") == "train":
             continue
         qps = r.get("aggregate_qps") or r.get("qps")
         if baseline_qps and qps and not r.get("speedup_vs_baseline"):
@@ -72,9 +152,6 @@ def main():
         "speedup",
         "efficiency",
         "waste_factor",
-        "init_model_s",
-        "infer_s",
-        "data_s",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -100,14 +177,10 @@ def main():
                         "speedup": "",
                         "efficiency": "",
                         "waste_factor": "",
-                        "init_model_s": "",
-                        "infer_s": r.get("reason", ""),
-                        "data_s": "",
                     }
                 )
                 continue
             lat = r.get("latency_ms") or r.get("step_ms") or {}
-            phase = r.get("phase_s") or {}
             extra = r.get("extra") or {}
             w.writerow(
                 {
@@ -128,15 +201,12 @@ def main():
                     "speedup": r.get("speedup_vs_baseline"),
                     "efficiency": r.get("parallel_efficiency"),
                     "waste_factor": extra.get("waste_factor"),
-                    "init_model_s": phase.get("init_model"),
-                    "infer_s": phase.get("infer") or phase.get("train"),
-                    "data_s": phase.get("data"),
                 }
             )
 
     md_path = os.path.join(out_dir, "summary.md")
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("# sched_bench summary (inference-first)\n\n")
+        f.write("# sched_bench summary (inference-first, no HCCL MP)\n\n")
         f.write(
             "| strategy | nproc | agg QPS | p50 ms | p90 ms | p99 ms | peak GB | speedup | eff | waste |\n"
         )
@@ -145,9 +215,9 @@ def main():
             if r.get("supported") is False:
                 f.write(f"| {r.get('strategy')} | — | BOUNDARY | — | — | — | — | — | — | — |\n")
                 continue
-            lat = r.get("latency_ms") or r.get("step_ms") or {}
+            lat = r.get("latency_ms") or {}
             extra = r.get("extra") or {}
-            q = r.get("aggregate_qps") or r.get("qps") or r.get("samples_per_sec")
+            q = r.get("aggregate_qps") or r.get("qps")
             f.write(
                 f"| {r.get('strategy')} | {r.get('nproc')} | {q} | "
                 f"{lat.get('p50')} | {lat.get('p90')} | {lat.get('p99')} | "
